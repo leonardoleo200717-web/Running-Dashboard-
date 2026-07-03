@@ -43,7 +43,12 @@ CANONICAL_DISTANCES_M = (
     100, 150, 200, 300, 400, 500, 600, 800, 1000,
     1200, 1500, 1600, 2000, 3000, 5000, 10000,
 )
-SNAP_TOLERANCE = 0.03  # ±3%
+# Spec said ±3%, but real files show GPS under-reading track reps by up
+# to ~4% (288.8 m for a 300 m rep). 4% still never overlaps two canonical
+# values. Recoveries are approximate jogs ("~200 m"), so their labels get
+# a much looser snap.
+SNAP_TOLERANCE = 0.04
+RECOVERY_SNAP_TOLERANCE = 0.15
 
 _INTENSITY_TO_KIND = {
     "warmup": "warmup",
@@ -291,6 +296,12 @@ def _level_splits(activity: dict, laps: list[dict]) -> dict | None:
     rep_like = _rep_like_laps(laps, modal_dist_c, modal_dur_c)
     if len(rep_like) > len(clean_actives):
         return None
+    # Splits that match (almost) no lap at all are equally suspect: on a
+    # real 5x(1000+300) file Garmin merged rep+recovery+rep into single
+    # ~1400 m actives that correspond to nothing the runner did. Only
+    # trust the laps instead when there are enough of them to work with.
+    if len(rep_like) < 0.5 * len(clean_actives) and len(laps) >= len(clean_actives):
+        return None
 
     _number_reps(segments)
     return {
@@ -373,28 +384,38 @@ def _level_lap_inference(activity: dict, laps: list[dict]) -> dict | None:
     kinds: dict[int, str] = {first_manual + k: kind
                              for k, kind in enumerate(kinds_block)}
 
-    # Autolap and manual laps coexist inside the rep block (spec 2.6: the
-    # 8x1000 file mixes triggers) — extend the block over adjacent laps
-    # that move at rep pace, so a distance-triggered first/last rep isn't
-    # misread as warmup/cooldown. Only meaningful when pace was the
-    # discriminator.
     if all(s is not None for s in speeds):
-        i = first_manual - 1
-        while i >= 0:
-            v = _lap_speed(laps[i])
-            if v is not None and v > threshold:
-                kinds[i] = "rep"
-                i -= 1
-            else:
-                break
-        j = last_manual + 1
-        while j < len(laps):
-            v = _lap_speed(laps[j])
-            if v is not None and v > threshold:
-                kinds[j] = "rep"
-                j += 1
-            else:
-                break
+        # The largest-gap threshold can land below warmup pace when the
+        # session has three speed levels (recovery < warmup < rep — real
+        # 8x1000 file: 6:00 / 4:50 / 3:45 per km). True reps are tightly
+        # clustered, so demote "reps" clearly slower than the rep cluster.
+        rep_speeds = sorted(v for v, k in zip(values, kinds_block) if k == "rep")
+        rep_floor = 0.88 * rep_speeds[len(rep_speeds) // 2] if rep_speeds else None
+        if rep_floor:
+            for i in list(kinds):
+                if kinds[i] == "rep" and _lap_speed(laps[i]) < rep_floor:
+                    kinds[i] = "other"
+
+        # Autolap and manual laps coexist inside the rep block (spec 2.6) —
+        # extend over adjacent laps at true rep pace, so a
+        # distance-triggered first/last rep isn't misread as warmup/cooldown.
+        if rep_floor:
+            i = first_manual - 1
+            while i >= 0:
+                v = _lap_speed(laps[i])
+                if v is not None and v >= rep_floor:
+                    kinds[i] = "rep"
+                    i -= 1
+                else:
+                    break
+            j = last_manual + 1
+            while j < len(laps):
+                v = _lap_speed(laps[j])
+                if v is not None and v >= rep_floor:
+                    kinds[j] = "rep"
+                    j += 1
+                else:
+                    break
 
     lo, hi = min(kinds), max(kinds)
     segments = []
@@ -462,19 +483,24 @@ def resolve(activity: dict) -> dict:
 
 # ------------------------------------------------------------ normalization
 
-def snap_distance(meters: float | None) -> int | None:
-    """Snap to a canonical rep distance when within ±3% (398 -> 400)."""
+def snap_distance(meters: float | None, tolerance: float = SNAP_TOLERANCE) -> int | None:
+    """Snap to a canonical rep distance when within tolerance (398 -> 400)."""
     if not meters:
         return None
     for canon in CANONICAL_DISTANCES_M:
-        if abs(meters - canon) / canon <= SNAP_TOLERANCE:
+        if abs(meters - canon) / canon <= tolerance:
             return canon
     return None
 
 
 def _fmt_seconds(seconds: float) -> str:
-    """Time reps are never rounded (spec 3.1): 60 -> 1', 90 -> 1'30"."""
+    """60 -> 1', 90 -> 1'30". Stored values stay exact (spec 3.1); for
+    display only, measurement noise is absorbed by snapping to the nearest
+    5 s when within 2 s (a rep timed at 61.4 s was programmed as 1')."""
     s = int(round(seconds))
+    nearest5 = 5 * round(seconds / 5)
+    if abs(seconds - nearest5) <= 2:
+        s = int(nearest5)
     minutes, rem = divmod(s, 60)
     if minutes and rem:
         return f"{minutes}'{rem:02d}\""
@@ -511,16 +537,42 @@ def _rep_label(group: list[dict]) -> str:
     return " + ".join(parts)
 
 
+def _cv(values: list[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    mean = statistics.mean(values)
+    return statistics.pstdev(values) / mean if mean else 0.0
+
+
 def _recovery_label(recoveries: list[dict], prefix: str = "R") -> str | None:
+    """Recoveries are approximate: label by whichever dimension the runner
+    actually kept constant. 202-212 m jogged in 70-86 s is "R200m"; 114-176 m
+    jogged in 59-62 s is "R1'". Structured steps say which explicitly."""
     if not recoveries:
         return None
-    dists = [_seg_snap(s) for s in recoveries]
-    if all(dists) and len(set(dists)) == 1:
-        return f"{prefix}{dists[0]}m"
-    durations = [s["timer_s"] for s in recoveries if s["timer_s"]]
-    modal = _modal(durations, bucket=5.0)
-    if modal:
-        return f"{prefix}{_fmt_seconds(modal)}"
+    hints = {s.get("duration_hint") for s in recoveries}
+    durs = [s["timer_s"] for s in recoveries if s["timer_s"]]
+    dists = [s["distance_m"] for s in recoveries if s["distance_m"]]
+
+    if "distance" in hints:
+        prefer_dist = True
+    elif "time" in hints:
+        prefer_dist = False
+    else:
+        prefer_dist = bool(dists) and (not durs or _cv(dists) < _cv(durs))
+
+    if prefer_dist and dists:
+        snap = snap_distance(statistics.median(dists), RECOVERY_SNAP_TOLERANCE)
+        if snap:
+            return f"{prefix}{snap}m"
+    if durs:
+        modal = _modal(durs, bucket=5.0)
+        if modal:
+            return f"{prefix}{_fmt_seconds(modal)}"
+    if dists:
+        snap = snap_distance(statistics.median(dists), RECOVERY_SNAP_TOLERANCE)
+        if snap:
+            return f"{prefix}{snap}m"
     return None
 
 
@@ -532,9 +584,12 @@ def _group_reps(reps: list[dict]) -> list[list[dict]]:
             prev = groups[-1][-1]
             same_dist = (_seg_snap(rep) is not None
                          and _seg_snap(rep) == _seg_snap(prev))
+            # Duration similarity groups on its own: reps measured
+            # 276-315 m / 59-62 s (real 15x1' file) must not fragment just
+            # because some distances happen to snap and others don't.
             same_time = (rep["timer_s"] and prev["timer_s"]
                          and abs(rep["timer_s"] - prev["timer_s"]) <= max(3, 0.05 * prev["timer_s"]))
-            if same_dist or (_seg_snap(rep) is None and same_time):
+            if same_dist or same_time:
                 groups[-1].append(rep)
                 continue
         groups.append([rep])
@@ -559,11 +614,20 @@ def structure_string(segments: list[dict]) -> str | None:
         if before and after:
             inner.append(seg)
 
-    # Set recoveries: markedly longer than the modal recovery.
-    modal_rec = _modal([r["timer_s"] for r in inner], bucket=5.0)
-    set_recs = [r for r in inner
-                if modal_rec and (r["timer_s"] or 0) >= SET_RECOVERY_FACTOR * modal_rec]
-    normal_recs = [r for r in inner if r not in set_recs]
+    # Set recoveries: split recovery durations at their largest gap. A
+    # modal-bucket rule fails when set recoveries outnumber any single
+    # bucket of jogged short recoveries (real 5x(1000+300) file: four
+    # ~156 s set recoveries vs 100 m jogs spread over 31-41 s).
+    set_recs: list[dict] = []
+    normal_recs = list(inner)
+    if len(inner) >= 2:
+        ds = sorted((r["timer_s"] or 0) for r in inner)
+        gap, gap_i = max((ds[i + 1] - ds[i], i) for i in range(len(ds) - 1))
+        short_median = statistics.median(ds[:gap_i + 1])
+        if gap >= max(30, short_median):
+            cut = (ds[gap_i] + ds[gap_i + 1]) / 2
+            set_recs = [r for r in inner if (r["timer_s"] or 0) > cut]
+            normal_recs = [r for r in inner if (r["timer_s"] or 0) <= cut]
 
     if set_recs:
         # Split reps into sets at each set recovery.

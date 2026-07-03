@@ -185,11 +185,16 @@ def free_8x1000() -> dict:
         ("distance", 1000), ("manual", 995), ("distance", 1000), ("manual", 991),
         ("manual", 997), ("distance", 1000), ("manual", 993), ("distance", 1000),
     ]
+    # Recoveries are distance-defined (~200 m) so the jogged duration
+    # varies — matches the real file (202-212 m in 70-86 s).
+    rec_specs = [(75, 209), (83, 202), (86, 212), (70, 204),
+                 (81, 206), (79, 210), (75, 211), (77, 205)]
     for i, (trigger, dist) in enumerate(rep_specs):
         b.lap(180, dist, hr=176, trigger=trigger)
         if i == 3:
             b.junk_lap()                            # double press after rep 4
-        b.lap(75, 200, hr=152, trigger="manual")    # jog recovery ~200 m
+        rec_dur, rec_dist = rec_specs[i]
+        b.lap(rec_dur, rec_dist, hr=152, trigger="manual")
     b.junk_lap()
     b.lap(300, 1000, hr=142, trigger="distance")    # cooldown
     b.lap(150, 500, hr=140, trigger="session_end")
@@ -224,9 +229,13 @@ def free_15x1() -> dict:
     b = Builder(datetime(2026, 6, 25, 17, 40, tzinfo=UTC))
     b.lap(340, 1000, hr=139, trigger="distance")   # warmup
     b.lap(340, 1000, hr=141, trigger="distance")
-    for _ in range(15):
+    # Recoveries are time-defined (1') so the jogged distance varies —
+    # matches the real file (114-176 m, all ~60 s).
+    rec_dists = [173, 176, 163, 159, 171, 160, 170, 124,
+                 148, 127, 133, 135, 122, 114, 150]
+    for i in range(15):
         b.lap(60, 330, hr=172, trigger="manual")   # rep: fast
-        b.lap(60, 132, hr=150, trigger="manual")   # recovery: slow, same duration
+        b.lap(60, rec_dists[i], hr=150, trigger="manual")  # recovery: slow, same duration
     b.lap(340, 1000, hr=143, trigger="distance")   # cooldown
     b.lap(100, 290, hr=141, trigger="session_end")
 

@@ -148,6 +148,84 @@ def test_structured_step_spanning_multiple_autolaps():
     assert result["structure"] == "15' + 10' + 8' R3'"
 
 
+# --- real-file regressions (sessions of 2026-06-30, 06-25, 06-02) ---
+
+def _free_builder(day):
+    from runlens.tests.fixtures import Builder
+    from datetime import datetime, timezone
+    return Builder(datetime(2026, 6, day, 19, 0, tzinfo=timezone.utc))
+
+
+def test_warmup_pace_between_recovery_and_rep_pace():
+    """Real 8x1000 file: warmup autolaps at 4:50/km sit between recovery
+    (6:00+) and rep (3:45) pace. They must not be swallowed as reps by the
+    fast/slow threshold, and the distance-triggered reps adjacent to the
+    manual block must still be picked up."""
+    b = _free_builder(30)
+    b.lap(297, 1000, hr=132, trigger="distance")   # warmup ~4:57/km
+    b.lap(288, 1000, hr=139, trigger="distance")   # warmup ~4:48/km
+    b.lap(226, 829, hr=142, trigger="manual")      # pre-rep manual, 4:32/km
+    b.lap(224, 1000, hr=162, trigger="distance")   # rep 1 (autolap!)
+    recs = ((75, 209), (83, 202), (86, 212), (70, 204), (81, 206), (79, 210), (75, 211))
+    for (rd, rm), d in zip(recs, (231, 226, 227, 226, 224, 228, 215)):
+        b.lap(rd, rm, hr=150, trigger="manual")    # ~200 m jog, varying time
+        b.lap(d, 1000, hr=172, trigger="manual" if d % 2 else "distance")
+    b.lap(360, 1000, hr=142, trigger="distance")   # cooldown 6:00/km
+    result = intervals.resolve(b.done())
+    reps = reps_of(result)
+    assert len(reps) == 8
+    assert result["structure"] == "8x1000m R200m"
+    assert result["session_type"] == "intervals"
+
+
+def test_composite_sets_with_short_and_set_recoveries():
+    """Real 5x(1000 p100 + 300) p400 file: Garmin merged whole sets into
+    single ~1400 m actives; splits must be rejected (they match no lap) and
+    lap inference must recover the set structure."""
+    b = _free_builder(2)
+    for _ in range(4):
+        b.lap(295, 1000, hr=130, trigger="distance")   # warmup
+    short_recs = ((31.2, 104.9), (33.7, 96.0), (38.3, 112.2), (35.4, 109.0), (41.3, 112.4))
+    set_recs = ((155.7, 422.3), (157.0, 415.7), (153.3, 416.5), (156.9, 421.8))
+    for i in range(5):
+        b.lap(222, 1000, hr=170, trigger="manual")     # 1000 rep
+        b.lap(*short_recs[i], hr=170, trigger="manual")        # ~100 m rec
+        b.lap(63, 289 + 3 * i, hr=176, trigger="manual")       # 300 rep
+        if i < 4:
+            b.lap(*set_recs[i], hr=145, trigger="manual")      # ~400 m set rec
+    b.lap(343, 1000, hr=139, trigger="distance")       # cooldown
+    # Garmin's broken merged splits.
+    b.split("interval_warmup", 1180, 4000, start=b.start)
+    for _ in range(3):
+        b.split("interval_active", 318, 1395)
+        b.split("interval_recovery", 155, 418)
+    b.split("interval_active", 318, 1395)
+    result = intervals.resolve(b.done())
+    assert result["detection_source"] == "lap_inference"
+    reps = reps_of(result)
+    assert len(reps) == 10
+    assert result["structure"] == "5x(1000m + 300m) R100m SR400m"
+
+
+def test_time_labels_absorb_measurement_noise():
+    """Real 15x1' file: reps timed 59.1-62.2 s must all read as 1', and
+    inconsistent distance snapping must not fragment the group."""
+    b = _free_builder(25)
+    b.lap(300, 1000, hr=140, trigger="distance")
+    durs = [60.6, 60.5, 60.1, 62.0, 62.2, 59.4, 60.1, 60.5,
+            60.1, 59.6, 61.0, 61.0, 61.4, 60.0, 59.1]
+    dists = [284.8, 278.5, 276.8, 286.8, 300.3, 279.9, 299.5, 290.3,
+             276.4, 292.6, 302.5, 314.7, 307.0, 290.0, 287.7]
+    for dur, dist in zip(durs, dists):
+        b.lap(dur, dist, hr=170, trigger="manual")
+        b.lap(60.4, 150, hr=155, trigger="manual")
+    b.lap(340, 1000, hr=145, trigger="distance")
+    result = intervals.resolve(b.done())
+    reps = reps_of(result)
+    assert len(reps) == 15
+    assert result["structure"] == "15x1' R1'"
+
+
 # --- every session records provenance ---
 
 @pytest.mark.parametrize("name,build", sorted(fixtures.ALL.items()))
