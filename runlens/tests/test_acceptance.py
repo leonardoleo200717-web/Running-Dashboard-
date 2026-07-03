@@ -109,6 +109,45 @@ def test_structured_2x10x1():
     assert result["session_type"] == "intervals"
 
 
+# --- real-file regression: autolap splits laps INSIDE long workout steps ---
+
+def test_structured_step_spanning_multiple_autolaps():
+    """Verified on a real FR265 file ("15' 10' 8'"): a 15' tempo step
+    arrives as 1000+1000+1000+664 m laps sharing one wkt_step_index.
+    They must merge into a single rep, not count as four."""
+    from runlens.tests.fixtures import Builder
+    from datetime import datetime, timezone
+
+    b = Builder(datetime(2026, 5, 17, 8, 11, tzinfo=timezone.utc),
+                structured=True, wkt_name="15' 10' 8'")
+    b.step(duration_type="open", intensity="warmup")                    # 0
+    b.step(duration_type="time", duration_time=900, intensity="active") # 1
+    b.step(duration_type="time", duration_time=180, intensity="recovery")  # 2
+    b.step(duration_type="time", duration_time=600, intensity="active") # 3
+    b.step(duration_type="time", duration_time=180, intensity="recovery")  # 4
+    b.step(duration_type="time", duration_time=480, intensity="active") # 5
+    b.step(duration_type="open", intensity="cooldown")                  # 6
+
+    b.lap(1200, 3400, hr=140, trigger="manual", wkt_step_index=0)
+    for dist, dur in ((1000, 244), (1000, 245), (1000, 248), (664, 163)):
+        b.lap(dur, dist, hr=175, trigger="distance", wkt_step_index=1)
+    b.lap(180, 500, hr=150, trigger="manual", wkt_step_index=2)
+    for dist, dur in ((1000, 239), (1000, 243), (496, 118)):
+        b.lap(dur, dist, hr=178, trigger="distance", wkt_step_index=3)
+    b.lap(180, 490, hr=152, trigger="manual", wkt_step_index=4)
+    for dist, dur in ((1000, 234), (1000, 235), (45, 11)):
+        b.lap(dur, dist, hr=181, trigger="distance", wkt_step_index=5)
+    b.lap(900, 2600, hr=142, trigger="manual", wkt_step_index=6)
+    activity = b.done()
+
+    result = intervals.resolve(activity)
+    assert result["detection_source"] == "structured_workout"
+    reps = reps_of(result)
+    assert len(reps) == 3
+    assert [round(r["timer_s"]) for r in reps] == [900, 600, 480]
+    assert result["structure"] == "15' + 10' + 8' R3'"
+
+
 # --- every session records provenance ---
 
 @pytest.mark.parametrize("name,build", sorted(fixtures.ALL.items()))

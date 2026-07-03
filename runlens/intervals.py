@@ -153,6 +153,37 @@ def _modal(values: list[float], bucket: float) -> float | None:
 
 # ------------------------------------------------------------ level 1
 
+def _merge_lap_group(group: list[dict], kind: str) -> dict:
+    """One workout-step execution can span several laps (autolap keeps
+    firing inside steps longer than 1 km — verified on real files: a 15'
+    tempo step arrives as 1000+1000+1000+664 m laps sharing one
+    wkt_step_index). Merge them into a single segment."""
+    if len(group) == 1:
+        seg = _segment_from_lap(group[0], kind, "structured_workout")
+        seg["wkt_step_index"] = group[0].get("wkt_step_index")
+        return seg
+    timer = sum(l.get("total_timer_time") or 0 for l in group)
+    dist = sum(l.get("total_distance") or 0 for l in group)
+    hr_weighted = [(l["avg_heart_rate"], l.get("total_timer_time") or 0)
+                   for l in group if l.get("avg_heart_rate")]
+    hr_t = sum(t for _, t in hr_weighted)
+    max_hrs = [l["max_heart_rate"] for l in group if l.get("max_heart_rate")]
+    return {
+        "kind": kind,
+        "rep_index": None,
+        "start_time": group[0].get("start_time"),
+        "end_time": group[-1].get("timestamp"),
+        "timer_s": timer,
+        "distance_m": dist,
+        "avg_speed_ms": dist / timer if timer else None,
+        "avg_hr": sum(h * t for h, t in hr_weighted) / hr_t if hr_t else None,
+        "max_hr": max(max_hrs) if max_hrs else None,
+        "outlier": False,
+        "source": "structured_workout",
+        "wkt_step_index": group[0].get("wkt_step_index"),
+    }
+
+
 def _level_structured(activity: dict, laps: list[dict]) -> dict | None:
     steps = {s.get("message_index"): s for s in activity.get("workout_steps", [])}
     if not steps:
@@ -161,16 +192,32 @@ def _level_structured(activity: dict, laps: list[dict]) -> dict | None:
     if not mapped:
         return None
 
-    segments = []
+    # Group consecutive laps sharing a wkt_step_index: same step execution.
+    # Repeated steps (8x400: every rep is index 1) never merge because a
+    # recovery lap with a different index always sits between them.
+    groups: list[list[dict]] = []
     for lap in laps:
         idx = lap.get("wkt_step_index")
+        if (groups and idx is not None
+                and groups[-1][-1].get("wkt_step_index") == idx):
+            groups[-1].append(lap)
+        else:
+            groups.append([lap])
+
+    segments = []
+    for group in groups:
+        idx = group[0].get("wkt_step_index")
         step = steps.get(idx)
         if step is None:
             kind = "other"
         else:
             kind = _INTENSITY_TO_KIND.get(step.get("intensity"), "other")
-        seg = _segment_from_lap(lap, kind, "structured_workout")
-        seg["wkt_step_index"] = idx
+        seg = _merge_lap_group(group, kind)
+        # Structured steps say exactly how they're defined: a time-based
+        # step must be labeled by time even if its meters happen to snap
+        # to a canonical distance (a 12' block covering ~3000 m is "12'",
+        # never "3000m").
+        seg["duration_hint"] = step.get("duration_type") if step else None
         segments.append(seg)
 
     _number_reps(segments)
@@ -436,20 +483,30 @@ def _fmt_seconds(seconds: float) -> str:
     return f"{rem}\""
 
 
+def _seg_snap(seg: dict) -> int | None:
+    """Canonical distance for labeling — suppressed for segments known to
+    be time-defined (structured duration_type hint)."""
+    if seg.get("duration_hint") == "time":
+        return None
+    return snap_distance(seg["distance_m"])
+
+
 def _rep_label(group: list[dict]) -> str:
-    """Label one run of consecutive same-shaped reps."""
-    snaps = [snap_distance(s["distance_m"]) for s in group]
+    """Label one run of consecutive same-shaped reps. A group of one gets
+    no count prefix: '15'' reads better than '1x15''."""
+    n = f"{len(group)}x" if len(group) > 1 else ""
+    snaps = [_seg_snap(s) for s in group]
     if all(snaps) and len(set(snaps)) == 1:
-        return f"{len(group)}x{snaps[0]}m"
+        return f"{n}{snaps[0]}m"
     durations = [s["timer_s"] for s in group if s["timer_s"]]
     if durations:
         modal = _modal(durations, bucket=5.0)
         if modal and all(abs(d - modal) <= max(3, 0.05 * modal) for d in durations):
-            return f"{len(group)}x{_fmt_seconds(modal)}"
+            return f"{n}{_fmt_seconds(modal)}"
     # heterogeneous group: label reps individually
     parts = []
     for s in group:
-        snap = snap_distance(s["distance_m"])
+        snap = _seg_snap(s)
         parts.append(f"{snap}m" if snap else _fmt_seconds(s["timer_s"] or 0))
     return " + ".join(parts)
 
@@ -457,7 +514,7 @@ def _rep_label(group: list[dict]) -> str:
 def _recovery_label(recoveries: list[dict], prefix: str = "R") -> str | None:
     if not recoveries:
         return None
-    dists = [snap_distance(s["distance_m"]) for s in recoveries]
+    dists = [_seg_snap(s) for s in recoveries]
     if all(dists) and len(set(dists)) == 1:
         return f"{prefix}{dists[0]}m"
     durations = [s["timer_s"] for s in recoveries if s["timer_s"]]
@@ -473,11 +530,11 @@ def _group_reps(reps: list[dict]) -> list[list[dict]]:
     for rep in reps:
         if groups:
             prev = groups[-1][-1]
-            same_dist = (snap_distance(rep["distance_m"]) is not None
-                         and snap_distance(rep["distance_m"]) == snap_distance(prev["distance_m"]))
+            same_dist = (_seg_snap(rep) is not None
+                         and _seg_snap(rep) == _seg_snap(prev))
             same_time = (rep["timer_s"] and prev["timer_s"]
                          and abs(rep["timer_s"] - prev["timer_s"]) <= max(3, 0.05 * prev["timer_s"]))
-            if same_dist or (snap_distance(rep["distance_m"]) is None and same_time):
+            if same_dist or (_seg_snap(rep) is None and same_time):
                 groups[-1].append(rep)
                 continue
         groups.append([rep])
