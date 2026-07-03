@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+{% block title %}RunLens — {{ session.start_time_utc | localdt }}{% endblock %}
+{% block content %}
+<h1>{{ session.start_time_utc | localdt }}
+  <span class="badge confidence-{{ session.confidence }}">{{ session.confidence }}</span>
+</h1>
+<p class="muted">
+  {{ session.origin }} · detected by {{ session.detection_source }}
+  {% if session.wkt_name %} · workout “{{ session.wkt_name }}”{% endif %}
+  {% if session.needs_manual_tag %} · <span class="flag">unclassified — tag manually</span>{% endif %}
+</p>
+
+<div class="stat-row">
+  <div class="stat"><div class="label">Type</div>
+    <div class="value">{{ session.session_type }}</div></div>
+  <div class="stat"><div class="label">Structure</div>
+    <div class="value">{{ session.structure or '—' }}</div></div>
+  <div class="stat"><div class="label">Distance</div>
+    <div class="value">{{ session.total_distance_m | km }}</div></div>
+  <div class="stat"><div class="label">Timer time</div>
+    <div class="value">{{ session.total_timer_s | hms }}</div></div>
+  <div class="stat"><div class="label">Avg HR</div>
+    <div class="value">{{ session.avg_hr | round(0) | int if session.avg_hr else '–' }}</div></div>
+</div>
+
+{% set reps = session.kpis.rep_table or [] %}
+{% if reps %}
+<h2>Rep table</h2>
+<div class="card">
+  <table>
+    <thead><tr><th>#</th><th>Distance</th><th>Duration</th><th>Pace</th>
+               <th>Avg HR</th><th>Max HR</th></tr></thead>
+    <tbody>
+    {% for r in reps %}
+      <tr {% if r.outlier %}class="muted" title="flagged outlier"{% endif %}>
+        <td>{{ r.rep_index or '⚑' }}</td>
+        <td>{{ '%.0f m' | format(r.distance_m) if r.distance_m else '–' }}</td>
+        <td>{{ r.timer_s | hms }}</td>
+        <td>{{ r.pace }}</td>
+        <td>{{ r.avg_hr | round(0) | int if r.avg_hr else '–' }}</td>
+        <td>{{ r.max_hr | round(0) | int if r.max_hr else '–' }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="stat-row">
+  {% set d = session.kpis.drift %}
+  <div class="stat"><div class="label">HR drift (first→last third)</div>
+    <div class="value">{{ '%+.1f%%' | format(d.hr_drift_pct) if d.hr_drift_pct is not none else '–' }}</div></div>
+  <div class="stat"><div class="label">Pace drift</div>
+    <div class="value">{{ '%+.1f%%' | format(d.pace_drift_pct) if d.pace_drift_pct is not none else '–' }}</div></div>
+  {% set rec = session.kpis.recovery %}
+  <div class="stat"><div class="label">Avg HR drop in recovery</div>
+    <div class="value">{{ '%.0f bpm' | format(rec.avg_hr_drop) if rec.avg_hr_drop is not none else '–' }}</div></div>
+</div>
+{% endif %}
+
+{% if series %}
+<h2>Pace</h2>
+<div class="card"><div class="chart-box"><canvas id="paceChart"></canvas></div></div>
+<h2>Heart rate</h2>
+<div class="card"><div class="chart-box"><canvas id="hrChart"></canvas></div></div>
+{% endif %}
+
+<h2>Manual override</h2>
+<div class="card">
+  <form method="post" action="{{ url_for('override', session_id=session.id) }}">
+    <label>Type
+      <select name="session_type">
+        <option value="">(keep: {{ session.session_type }})</option>
+        {% for t in ['easy','long','intervals','fartlek','race','unknown'] %}
+        <option value="{{ t }}">{{ t }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Structure
+      <input type="text" name="structure" placeholder="e.g. 8x400m R200m"
+             value="">
+    </label>
+    <button type="submit">Save override</button>
+    <span class="muted">Overrides always win and persist across re-parses.</span>
+  </form>
+</div>
+{% endblock %}
+
+{% block scripts %}
+{% if series %}
+<script>
+  const series = {{ series | tojson }};
+  const labels = series.map(p => p.t);
+  const c = vizColors();
+
+  const paceOpts = baseOptions(c);
+  paceOpts.scales.y.reverse = true;   // faster pace reads upward
+  paceOpts.scales.y.ticks = { callback: v => fmtPace(v) };
+  paceOpts.plugins.tooltip = { callbacks: { label: ctx => ' ' + fmtPace(ctx.parsed.y) } };
+  new Chart(document.getElementById('paceChart'), {
+    type: 'line',
+    data: { labels, datasets: [{
+      label: 'Pace', data: series.map(p => p.pace),
+      borderColor: c.pace, borderWidth: 2, pointRadius: 0, spanGaps: true,
+    }]},
+    options: paceOpts,
+  });
+
+  const hrOpts = baseOptions(c);
+  hrOpts.plugins.tooltip = { callbacks: { label: ctx => ' ' + ctx.parsed.y + ' bpm' } };
+  new Chart(document.getElementById('hrChart'), {
+    type: 'line',
+    data: { labels, datasets: [{
+      label: 'HR', data: series.map(p => p.hr),
+      borderColor: c.hr, borderWidth: 2, pointRadius: 0, spanGaps: true,
+    }]},
+    options: hrOpts,
+  });
+</script>
+{% endif %}
+{% endblock %}

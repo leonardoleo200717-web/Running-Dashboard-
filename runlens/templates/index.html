@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}RunLens — Sessions{% endblock %}
+{% block content %}
+<h1>Sessions</h1>
+
+<div class="card">
+  <form action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
+    <input type="file" name="fit_files" accept=".fit,.FIT" multiple>
+    <button class="primary" type="submit">Import FIT files</button>
+    <span class="muted">Re-uploading the same file is safe (idempotent).</span>
+  </form>
+</div>
+
+{% if sessions %}
+<div class="card">
+  <table>
+    <thead>
+      <tr>
+        <th>Date</th><th>Type</th><th>Structure</th><th>Distance</th>
+        <th>Time</th><th>Avg HR</th><th>Detection</th><th>Confidence</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for s in sessions %}
+      <tr>
+        <td><a class="rowlink" href="{{ url_for('session_detail', session_id=s.id) }}">
+            {{ s.start_time_utc | localdt }}</a></td>
+        <td>{{ s.session_type }}{% if 'session_type' in s.overridden %}
+            <span class="muted" title="manual override">✎</span>{% endif %}</td>
+        <td>{{ s.structure or (s.wkt_name or '—') }}</td>
+        <td>{{ s.total_distance_m | km }}</td>
+        <td>{{ s.total_timer_s | hms }}</td>
+        <td>{{ s.avg_hr | round(0) | int if s.avg_hr else '–' }}</td>
+        <td class="muted">{{ s.detection_source }}</td>
+        <td>
+          <span class="badge confidence-{{ s.confidence }}">{{ s.confidence }}</span>
+          {% if s.needs_manual_tag %}<span class="flag">tag manually</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<p class="muted">No sessions yet — import your Garmin FIT files above.</p>
+{% endif %}
+{% endblock %}

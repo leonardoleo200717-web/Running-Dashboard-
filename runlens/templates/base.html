@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}RunLens{% endblock %}</title>
+<!-- Chart.js vendored (single UMD file, no build step, no npm install):
+     the dashboard is local-first and must work offline. -->
+<script src="{{ url_for('static', filename='chart.umd.min.js') }}"></script>
+<style>
+  :root {
+    --page: #f9f9f7; --surface: #fcfcfb;
+    --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+    --grid: #e1e0d9; --baseline: #c3c2b7;
+    --border: rgba(11,11,11,0.10);
+    --series-pace: #2a78d6;   /* categorical slot 1 (blue) */
+    --series-hr: #e34948;     /* categorical slot 6 (red) */
+    --series-vol: #2a78d6;
+    --status-good: #0ca30c; --status-warn: #fab219; --status-crit: #d03b3b;
+    --good-text: #006300;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page: #0d0d0d; --surface: #1a1a19;
+      --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+      --grid: #2c2c2a; --baseline: #383835;
+      --border: rgba(255,255,255,0.10);
+      --series-pace: #3987e5;
+      --series-hr: #e66767;
+      --series-vol: #3987e5;
+      --good-text: #0ca30c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 15px; line-height: 1.45;
+  }
+  nav {
+    display: flex; gap: 1.25rem; align-items: baseline;
+    padding: 0.8rem 1.5rem; border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+  nav .brand { font-weight: 700; font-size: 1.1rem; margin-right: 0.5rem; }
+  nav a { color: var(--ink-2); text-decoration: none; }
+  nav a:hover, nav a.active { color: var(--ink); }
+  main { max-width: 1000px; margin: 0 auto; padding: 1.5rem; }
+  h1 { font-size: 1.4rem; margin: 0 0 1rem; }
+  h2 { font-size: 1.05rem; margin: 1.8rem 0 0.6rem; color: var(--ink-2); }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 1rem 1.2rem; margin-bottom: 1.2rem;
+  }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 0.4rem 0.7rem; }
+  th { color: var(--muted); font-weight: 600; font-size: 0.8rem;
+       text-transform: uppercase; letter-spacing: 0.03em;
+       border-bottom: 1px solid var(--baseline); }
+  td { border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+  tr:last-child td { border-bottom: none; }
+  a.rowlink { color: var(--ink); text-decoration: none; font-weight: 600; }
+  a.rowlink:hover { text-decoration: underline; }
+  .badge {
+    display: inline-block; padding: 0.05rem 0.5rem; border-radius: 999px;
+    font-size: 0.75rem; font-weight: 600; border: 1px solid var(--border);
+    color: var(--ink-2); background: transparent;
+  }
+  .badge.confidence-high   { border-color: var(--status-good); }
+  .badge.confidence-medium { border-color: var(--status-warn); }
+  .badge.confidence-low    { border-color: var(--status-crit); }
+  .flag { color: var(--status-crit); font-weight: 600; font-size: 0.8rem; }
+  .muted { color: var(--muted); }
+  .stat-row { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.2rem; }
+  .stat {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 0.7rem 1.1rem; min-width: 8.5rem;
+  }
+  .stat .label { color: var(--muted); font-size: 0.75rem; text-transform: uppercase;
+                 letter-spacing: 0.03em; }
+  .stat .value { font-size: 1.35rem; font-weight: 700; }
+  .chart-box { position: relative; height: 280px; }
+  .chart-box.tall { height: 340px; }
+  form.inline { display: inline; }
+  button, input[type=submit] {
+    font: inherit; padding: 0.35rem 0.9rem; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--surface);
+    color: var(--ink); cursor: pointer;
+  }
+  button:hover { border-color: var(--baseline); }
+  button.primary { background: var(--series-pace); color: #fff; border: none; }
+  input[type=text], select {
+    font: inherit; padding: 0.3rem 0.5rem; border-radius: 8px;
+    border: 1px solid var(--baseline); background: var(--surface); color: var(--ink);
+  }
+  ul.flashes { list-style: none; padding: 0; }
+  ul.flashes li { padding: 0.5rem 0.9rem; border-radius: 8px; margin-bottom: 0.4rem;
+                  background: var(--surface); border: 1px solid var(--border); }
+</style>
+</head>
+<body>
+<nav>
+  <span class="brand">RunLens</span>
+  <a href="{{ url_for('index') }}">Sessions</a>
+  <a href="{{ url_for('trends') }}">Trends</a>
+  <a href="{{ url_for('progression') }}">Progression</a>
+</nav>
+<main>
+  {% with messages = get_flashed_messages() %}
+    {% if messages %}
+      <ul class="flashes">{% for m in messages %}<li>{{ m }}</li>{% endfor %}</ul>
+    {% endif %}
+  {% endwith %}
+  {% block content %}{% endblock %}
+</main>
+<script>
+  // Shared chart theming: read the palette from CSS custom properties so
+  // light/dark values swap in one place.
+  function vizColors() {
+    const s = getComputedStyle(document.documentElement);
+    return {
+      pace: s.getPropertyValue('--series-pace').trim(),
+      hr: s.getPropertyValue('--series-hr').trim(),
+      vol: s.getPropertyValue('--series-vol').trim(),
+      ink: s.getPropertyValue('--ink-2').trim(),
+      muted: s.getPropertyValue('--muted').trim(),
+      grid: s.getPropertyValue('--grid').trim(),
+      baseline: s.getPropertyValue('--baseline').trim(),
+      surface: s.getPropertyValue('--surface').trim(),
+    };
+  }
+  function baseOptions(c) {
+    Chart.defaults.font.family = 'system-ui, -apple-system, "Segoe UI", sans-serif';
+    Chart.defaults.color = c.muted;
+    return {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { grid: { display: false }, border: { color: c.baseline },
+             ticks: { maxTicksLimit: 10 } },
+        y: { grid: { color: c.grid }, border: { display: false } },
+      },
+    };
+  }
+  function fmtPace(sPerKm) {
+    if (sPerKm == null) return '–';
+    const m = Math.floor(sPerKm / 60), s = Math.round(sPerKm % 60);
+    return m + ':' + String(s).padStart(2, '0') + '/km';
+  }
+  // Dark-mode steps are a selected palette, not a flip: re-render on change.
+  window.matchMedia('(prefers-color-scheme: dark)')
+        .addEventListener('change', () => location.reload());
+</script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

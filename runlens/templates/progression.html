@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+{% block title %}RunLens — Aerobic progression{% endblock %}
+{% block content %}
+<h1>Aerobic progression tracker</h1>
+<p class="muted">Confirmed steady blocks (≥10 min timer time, pace CV ≤ 5%,
+no pauses, never a recovery). Auto-detected blocks are proposed below —
+nothing enters the chart until you confirm it.</p>
+
+<div class="card">
+  {% if chart %}
+  <div class="chart-box tall"><canvas id="tracker"></canvas></div>
+  {% else %}<p class="muted">No confirmed points yet.</p>{% endif %}
+</div>
+
+{% if proposed %}
+<h2>Proposed points</h2>
+<div class="card">
+  <table>
+    <thead><tr><th>Date</th><th>Block</th><th>Pace</th><th>Avg HR</th><th></th></tr></thead>
+    <tbody>
+    {% for p in proposed %}
+      <tr>
+        <td>{{ p.date }}</td>
+        <td>{{ p.label }}
+          {% if p.session_id %}
+          <a class="muted" href="{{ url_for('session_detail', session_id=p.session_id) }}">view session</a>
+          {% endif %}</td>
+        <td>{{ p.pace_s_km | pace }}</td>
+        <td>{{ p.avg_hr | round(0) | int }}</td>
+        <td>
+          <form class="inline" method="post"
+                action="{{ url_for('progression_action', point_id=p.id, action='confirm') }}">
+            <button class="primary" type="submit">Confirm</button>
+          </form>
+          <form class="inline" method="post"
+                action="{{ url_for('progression_action', point_id=p.id, action='reject') }}">
+            <button type="submit">Reject</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+<h2>Confirmed points</h2>
+<div class="card">
+  <table>
+    <thead><tr><th>Date</th><th>Label</th><th>Pace</th><th>Avg HR</th><th>Source</th></tr></thead>
+    <tbody>
+    {% for p in confirmed %}
+      <tr>
+        <td>{{ p.date }}</td><td>{{ p.label }}</td>
+        <td>{{ p.pace_s_km | pace }}</td>
+        <td>{{ p.avg_hr | round(0) | int }}</td>
+        <td class="muted">{{ p.source }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+{% if chart %}
+<script>
+  // Spec 4.1 mandates a single time-series chart with pace on y1 and avg HR
+  // on y2 — the one intentional two-scale chart in the app.
+  const c = vizColors();
+  const pts = {{ chart | tojson }};
+  const o = baseOptions(c);
+  o.plugins.legend = { display: true, labels: { boxWidth: 12, boxHeight: 12 } };
+  o.scales.y = {
+    position: 'left', reverse: true, grid: { color: c.grid },
+    border: { display: false },
+    title: { display: true, text: 'Pace', color: c.muted },
+    ticks: { callback: v => fmtPace(v) },
+  };
+  o.scales.y2 = {
+    position: 'right', grid: { drawOnChartArea: false },
+    border: { display: false },
+    title: { display: true, text: 'Avg HR (bpm)', color: c.muted },
+  };
+  o.plugins.tooltip = { callbacks: {
+    label: ctx => ctx.dataset.yAxisID === 'y2'
+      ? ' HR ' + ctx.parsed.y + ' bpm'
+      : ' pace ' + fmtPace(ctx.parsed.y),
+    afterTitle: items => pts[items[0].dataIndex].label,
+  }};
+  new Chart(document.getElementById('tracker'), {
+    type: 'line',
+    data: { labels: pts.map(p => p.date), datasets: [
+      { label: 'Pace', yAxisID: 'y', data: pts.map(p => p.pace),
+        borderColor: c.pace, backgroundColor: c.pace,
+        borderWidth: 2, pointRadius: 4, pointHoverRadius: 6 },
+      { label: 'Avg HR', yAxisID: 'y2', data: pts.map(p => p.hr),
+        borderColor: c.hr, backgroundColor: c.hr,
+        borderWidth: 2, pointRadius: 4, pointHoverRadius: 6 },
+    ]},
+    options: o,
+  });
+</script>
+{% endif %}
+{% endblock %}
