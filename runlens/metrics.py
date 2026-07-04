@@ -7,6 +7,7 @@ the pause list from ingest.timer_pauses().
 
 from __future__ import annotations
 
+import math
 import statistics
 from datetime import timedelta
 
@@ -204,6 +205,118 @@ def intensity_distribution(time_in_zone: list[dict]) -> dict | None:
 
 
 # ------------------------------------------------------------ progression
+
+def backfill_segment_hr(segments: list[dict], records: list[dict]) -> None:
+    """Fill avg/max HR on segments that lack them (split-derived segments
+    carry no HR) from the 1 Hz records in their window. In place."""
+    for seg in segments:
+        if seg.get("avg_hr") is not None or not seg.get("start_time") or not seg.get("end_time"):
+            continue
+        hrs = [r["heart_rate"] for r in _records_in(records, seg["start_time"], seg["end_time"])
+               if r.get("heart_rate")]
+        if hrs:
+            seg["avg_hr"] = round(statistics.mean(hrs), 1)
+            if seg.get("max_hr") is None:
+                seg["max_hr"] = max(hrs)
+
+
+# ------------------------------------------------------------ race prediction
+
+BEST_EFFORT_DISTANCES_M = (1000, 1609, 3000, 5000, 10000)
+RACE_DISTANCES_M = (("5K", 5000.0), ("10K", 10000.0),
+                    ("Half marathon", 21097.5), ("Marathon", 42195.0))
+
+
+def best_efforts(records: list[dict],
+                 targets=BEST_EFFORT_DISTANCES_M) -> dict[int, float]:
+    """Fastest time (s) covering each target distance, from cumulative
+    1 Hz records. Elapsed-time based, so pauses only make it slower —
+    never optimistic."""
+    pts = [(r["timestamp"], r["distance"]) for r in records
+           if r.get("distance") is not None and r.get("timestamp") is not None]
+    out: dict[int, float] = {}
+    for target in targets:
+        best = None
+        j = 0
+        for i in range(len(pts)):
+            while j < i and pts[i][1] - pts[j + 1][1] >= target:
+                j += 1
+            if pts[i][1] - pts[j][1] >= target:
+                t = (pts[i][0] - pts[j][0]).total_seconds()
+                if t > 0:
+                    scaled = t * target / (pts[i][1] - pts[j][1])
+                    best = min(best, scaled) if best else scaled
+        if best:
+            out[target] = round(best, 1)
+    return out
+
+
+def predict_riegel(t1: float, d1: float, d2: float) -> float:
+    """Riegel (1981) endurance formula: T2 = T1 * (D2/D1)^1.06."""
+    return t1 * (d2 / d1) ** 1.06
+
+
+def predict_cameron(t1: float, d1: float, d2: float) -> float:
+    """Dave Cameron's model (empirical fit on elite times), miles-based."""
+    def f(miles: float) -> float:
+        return 13.49681 - 0.048865 * miles + 2.438936 / (miles ** 0.7905)
+    m1, m2 = d1 / 1609.344, d2 / 1609.344
+    return (t1 / m1) * (f(m1) / f(m2)) * m2
+
+
+def _vo2(v_m_per_min: float) -> float:
+    return -4.60 + 0.182258 * v_m_per_min + 0.000104 * v_m_per_min ** 2
+
+
+def _pct_vo2max(t_min: float) -> float:
+    return (0.8 + 0.1894393 * math.exp(-0.012778 * t_min)
+            + 0.2989558 * math.exp(-0.1932605 * t_min))
+
+
+def vdot_from(t1: float, d1: float) -> float:
+    """Daniels-Gilbert VDOT from a performance (t seconds, d meters)."""
+    t_min = t1 / 60.0
+    return _vo2(d1 / t_min) / _pct_vo2max(t_min)
+
+
+def predict_vdot(t1: float, d1: float, d2: float) -> float:
+    """Daniels-Gilbert: find the time at d2 whose implied VDOT matches."""
+    vdot = vdot_from(t1, d1)
+    lo, hi = 2.0, 600.0  # minutes
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        implied = _vo2(d2 / mid) / _pct_vo2max(mid)
+        if implied > vdot:
+            lo = mid      # implied effort too hard -> allow more time
+        else:
+            hi = mid
+    return mid * 60.0
+
+
+def race_predictions(t1: float, d1: float) -> list[dict]:
+    """Predictions for the standard race distances from anchor (t1, d1)
+    with the three classic models."""
+    rows = []
+    for label, d2 in RACE_DISTANCES_M:
+        r = predict_riegel(t1, d1, d2)
+        v = predict_vdot(t1, d1, d2)
+        c = predict_cameron(t1, d1, d2)
+        rows.append({
+            "label": label, "distance_m": d2,
+            "riegel_s": round(r), "vdot_s": round(v), "cameron_s": round(c),
+            "mean_s": round((r + v + c) / 3),
+        })
+    return rows
+
+
+def fmt_hms(seconds: float | None) -> str:
+    if not seconds:
+        return "–"
+    s = int(round(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
 
 # ------------------------------------------------------------ trend modeling
 

@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}RunLens — Race predictor{% endblock %}
+{% block content %}
+<h1>Race predictor</h1>
+<p class="muted">Three classic models — Riegel (power law), Daniels-Gilbert
+VDOT, and Cameron — anchored on your best recent effort (last
+{{ window_days }} days, from 1 Hz record data).</p>
+
+{% if anchor %}
+<div class="stat-row">
+  <div class="stat"><div class="label">Anchor effort</div>
+    <div class="value">{{ (anchor.d / 1000) | round(1) }} km in {{ anchor.t | hms }}</div></div>
+  <div class="stat"><div class="label">Anchor date</div>
+    <div class="value">{{ anchor.date }}</div></div>
+  <div class="stat"><div class="label">VDOT</div>
+    <div class="value">{{ vdot }}</div></div>
+</div>
+
+<h2>Predictions</h2>
+<div class="card">
+  <table>
+    <thead><tr><th>Distance</th><th>Riegel</th><th>VDOT (Daniels)</th>
+               <th>Cameron</th><th>Consensus</th><th>Pace</th></tr></thead>
+    <tbody>
+    {% for p in predictions %}
+      <tr>
+        <td><strong>{{ p.label }}</strong></td>
+        <td>{{ p.riegel_s | hms }}</td>
+        <td>{{ p.vdot_s | hms }}</td>
+        <td>{{ p.cameron_s | hms }}</td>
+        <td><strong>{{ p.mean_s | hms }}</strong></td>
+        <td>{{ (p.mean_s / (p.distance_m / 1000)) | pace }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+<p class="muted" style="font-size:.85rem">Marathon and half-marathon
+predictions from a {{ (anchor.d / 1000) | round(1) }} km anchor assume the
+endurance is trained: treat them as a ceiling unless weekly volume supports
+the distance. A longer anchor (10 km best) makes long predictions much more
+reliable.</p>
+
+<h2>Best efforts (last {{ window_days }} days)</h2>
+<div class="card">
+  <table>
+    <thead><tr><th>Distance</th><th>Time</th><th>Pace</th><th>Date</th><th></th></tr></thead>
+    <tbody>
+    {% for d, b in bests | dictsort %}
+      <tr {% if anchor and d == anchor.d %}style="font-weight:700"{% endif %}>
+        <td>{{ d }} m {% if anchor and d == anchor.d %}<span class="muted">← anchor</span>{% endif %}</td>
+        <td>{{ b.t | hms }}</td>
+        <td>{{ (b.t / (d / 1000)) | pace }}</td>
+        <td>{{ b.date }}</td>
+        <td><a class="muted" href="{{ url_for('session_detail', session_id=b.session_id) }}">view session</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<p class="muted">No qualifying efforts found yet — import sessions with at
+least 1 km of continuous running in the last {{ window_days }} days.</p>
+{% endif %}
+{% endblock %}

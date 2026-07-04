@@ -326,6 +326,104 @@ def test_user_created_workout_warmup_cooldown_marked_active():
     assert kinds[0] == "warmup" and kinds[-1] == "cooldown"
 
 
+# --- real-file regressions (sessions of 2026-06-04, 02-22) ---
+
+def test_structured_step_tail_laps_are_not_junk():
+    """Real 3x8' file: autolap fires just before a time step ends, leaving
+    2-4 s tail laps that carry the step index. They must merge back into
+    the step (dropping them read 3x8' as 3x7'58")."""
+    from runlens.tests.fixtures import Builder
+    from datetime import datetime, timezone
+    b = Builder(datetime(2026, 6, 4, 16, 20, tzinfo=timezone.utc),
+                structured=True, wkt_name="3x8'")
+    b.step(duration_type="open", intensity="warmup")
+    b.step(duration_type="time", duration_time=480, intensity="active")
+    b.step(duration_type="time", duration_time=120, intensity="recovery")
+    b.step(duration_type="repeat_until_steps_cmplt", duration_step=1, repeat_steps=3)
+    b.step(duration_type="open", intensity="cooldown")
+    b.lap(900, 3100, hr=145, trigger="manual", wkt_step_index=0)
+    for d1, d2, tail in ((238.7, 237.2, 4.1), (239.8, 238.2, 2.0),
+                         (238.4, 239.2, 2.4)):
+        b.lap(d1, 1000, hr=175, trigger="distance", wkt_step_index=1)
+        b.lap(d2, 1000, hr=180, trigger="distance", wkt_step_index=1)
+        b.lap(tail, tail * 4, hr=182, trigger="time", wkt_step_index=1)
+        b.lap(120, 350, hr=160, trigger="time", wkt_step_index=2)
+    b.lap(600, 2000, hr=150, trigger="manual", wkt_step_index=4)
+    result = intervals.resolve(b.done())
+    reps = reps_of(result)
+    assert [round(r["timer_s"]) for r in reps] == [480, 480, 480]
+    assert result["structure"] == "3x8' R2'"
+
+
+def test_suggested_workout_warmup_has_slower_target_band():
+    """Real 'Training some speed' files: Garmin suggested workouts type
+    the warmup as a distance step with intensity 'active' but an easy
+    target band strictly below the rep targets."""
+    from runlens.tests.fixtures import Builder
+    from datetime import datetime, timezone
+    b = Builder(datetime(2026, 2, 22, 16, 6, tzinfo=timezone.utc),
+                structured=True, wkt_name="Training some speed")
+    b.step(duration_type="distance", duration_distance=4000, intensity="active",
+           target_type="speed", custom_target_speed_low=3.3,
+           custom_target_speed_high=3.448)                       # warmup!
+    b.step(duration_type="distance", duration_distance=1500, intensity="active",
+           target_type="speed", custom_target_speed_low=3.774,
+           custom_target_speed_high=4.0)
+    b.step(duration_type="distance", duration_distance=500, intensity="recovery",
+           target_type="speed")
+    b.step(duration_type="repeat_until_steps_cmplt", duration_step=1, repeat_steps=6)
+    b.step(duration_type="open", intensity="active", target_type="speed")  # cooldown
+    for _ in range(4):
+        b.lap(290, 1000, hr=143, trigger="distance", wkt_step_index=0)
+    for _ in range(6):
+        b.lap(247, 1000, hr=160, trigger="distance", wkt_step_index=1)
+        b.lap(123, 500, hr=165, trigger="distance", wkt_step_index=1)
+        b.lap(148, 500, hr=155, trigger="distance", wkt_step_index=2)
+    b.lap(176, 609, hr=155, trigger="distance", wkt_step_index=4)
+    result = intervals.resolve(b.done())
+    assert result["segments"][0]["kind"] == "warmup"
+    assert result["segments"][-1]["kind"] == "cooldown"
+    reps = reps_of(result)
+    assert len(reps) == 6
+    assert result["structure"] == "6x1500m R500m"
+
+
+# --- race prediction models ---
+
+def test_race_prediction_models_sane():
+    from runlens import metrics
+    # Anchor: 10 km in 41:21 (2481 s). Predicting the anchor distance
+    # must return ~the anchor time for every model.
+    for model in (metrics.predict_riegel, metrics.predict_vdot,
+                  metrics.predict_cameron):
+        assert model(2481, 10000, 10000) == pytest.approx(2481, rel=0.01)
+    # 5K must be faster than half of the 10K time is slower-paced… i.e.
+    # 5K time > 10K/2 * 0.9 and < 10K/2 (positive endurance slowdown).
+    for model in (metrics.predict_riegel, metrics.predict_vdot,
+                  metrics.predict_cameron):
+        t5 = model(2481, 10000, 5000)
+        assert 2481 / 2 * 0.90 < t5 < 2481 / 2
+        tm = model(2481, 10000, 42195)
+        assert 2481 * 4.2 < tm < 2481 * 5.2  # marathon in a plausible band
+    # VDOT for 41:21 10K is ~50 (Daniels' tables).
+    assert metrics.vdot_from(2481, 10000) == pytest.approx(50.0, abs=0.8)
+
+
+def test_best_efforts_two_pointer():
+    from runlens import metrics
+    from datetime import datetime, timedelta, timezone
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    # 20 min at 5:00/km then 10 min at 4:00/km -> best 1k = 240 s
+    records, dist = [], 0.0
+    for i in range(1800):
+        speed = 10 / 3 if i < 1200 else 25 / 6
+        dist += speed
+        records.append({"timestamp": t0 + timedelta(seconds=i), "distance": dist})
+    eff = metrics.best_efforts(records, targets=(1000, 3000))
+    assert eff[1000] == pytest.approx(240, abs=2)
+    assert eff[3000] < 3000 / (10 / 3)  # faster than pure easy pace
+
+
 # --- every session records provenance ---
 
 @pytest.mark.parametrize("name,build", sorted(fixtures.ALL.items()))

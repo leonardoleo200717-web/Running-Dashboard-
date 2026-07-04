@@ -245,9 +245,29 @@ def get_session(con: sqlite3.Connection, session_id: int) -> dict | None:
 
 
 def get_intervals(con: sqlite3.Connection, session_id: int) -> list[dict]:
+    """Segments with per-segment kind overrides applied (keys
+    'segkind:<start_time_iso>' — stable across re-parses) and rep indices
+    renumbered accordingly. Manual override always wins (spec 3)."""
     rows = con.execute(
         "SELECT * FROM intervals WHERE session_id = ? ORDER BY seq", (session_id,))
-    return [dict(r) for r in rows]
+    segs = [dict(r) for r in rows]
+    overrides = get_overrides(con, session_id)
+    kind_ov = {k.removeprefix("segkind:"): v
+               for k, v in overrides.items() if k.startswith("segkind:")}
+    if kind_ov:
+        for s in segs:
+            new = kind_ov.get(s.get("start_time") or "")
+            if new:
+                s["kind"] = new
+                s["overridden_kind"] = True
+    n = 0
+    for s in segs:
+        if s["kind"] == "rep" and not s["outlier"]:
+            n += 1
+            s["rep_index"] = n
+        else:
+            s["rep_index"] = None
+    return segs
 
 
 def get_records(con: sqlite3.Connection, session_id: int) -> list[dict]:

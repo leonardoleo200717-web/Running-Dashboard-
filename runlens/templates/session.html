@@ -88,6 +88,43 @@
 <div class="card"><div class="chart-box"><canvas id="hrChart"></canvas></div></div>
 {% endif %}
 
+{% if segments %}
+<h2>Segments <span class="muted" style="font-weight:400">— reclassify with the dropdown; structure &amp; KPIs recompute</span></h2>
+<div class="card">
+  <table>
+    <thead><tr><th>#</th><th>Kind</th><th>Distance</th><th>Duration</th>
+               <th>Pace</th><th>Avg HR</th></tr></thead>
+    <tbody>
+    {% for seg in segments %}
+      <tr>
+        <td class="muted">{{ seg.seq + 1 }}{% if seg.rep_index %}
+          <strong>· rep {{ seg.rep_index }}</strong>{% endif %}</td>
+        <td>
+          <form method="post" action="{{ url_for('segment_override', session_id=session.id) }}">
+            <input type="hidden" name="seq" value="{{ seg.seq }}">
+            <select name="kind" onchange="this.form.submit()"
+                    {% if seg.overridden_kind %}title="manually reclassified"{% endif %}>
+              {% for value, label in segment_kinds.items() %}
+              <option value="{{ value }}" {{ 'selected' if seg.kind == value }}>{{ label }}</option>
+              {% endfor %}
+              {% if seg.kind not in segment_kinds %}
+              <option value="{{ seg.kind }}" selected>{{ seg.kind }}</option>
+              {% endif %}
+            </select>
+            {% if seg.overridden_kind %}<span class="muted" title="manual override">✎</span>{% endif %}
+          </form>
+        </td>
+        <td>{{ '%.0f m' | format(seg.distance_m) if seg.distance_m else '–' }}</td>
+        <td>{{ seg.timer_s | hms }}</td>
+        <td>{{ (1000 / seg.avg_speed_ms) | pace if seg.avg_speed_ms else '–' }}</td>
+        <td>{{ seg.avg_hr | round(0) | int if seg.avg_hr else '–' }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
 {% if similar %}
 <h2>Similar sessions</h2>
 <div class="card">

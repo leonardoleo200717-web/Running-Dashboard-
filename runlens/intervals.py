@@ -79,9 +79,17 @@ SET_RECOVERY_FACTOR = 2.0     # recovery this much longer than modal = set recov
 # ---------------------------------------------------------------- helpers
 
 def clean_laps(laps: list[dict]) -> list[dict]:
-    """Drop junk laps (duration < 2 s or distance < 5 m) before analysis."""
+    """Drop junk laps (double button presses) before analysis.
+
+    Laps carrying a wkt_step_index are never junk: an autolap firing just
+    before a time step ends leaves a real 2-4 s tail lap that must merge
+    back into its step (verified on a 3x8' file — dropping the tails read
+    as 3x7'58")."""
     out = []
     for lap in laps:
+        if lap.get("wkt_step_index") is not None:
+            out.append(lap)
+            continue
         dur = lap.get("total_timer_time") or 0.0
         dist = lap.get("total_distance")
         if dur < JUNK_MAX_DURATION_S:
@@ -205,10 +213,22 @@ def _step_kinds(steps: dict) -> dict:
                 and s.get("duration_step") is not None):
             covered.update(range(int(s["duration_step"]), i))
     if covered:
+        # Reference effort: the slowest rep-step target inside the repeats.
+        rep_lows = [s.get("custom_target_speed_low") for i, s in steps.items()
+                    if i in covered and kinds.get(i) == "rep"
+                    and s.get("custom_target_speed_low")]
+        ref_low = min(rep_lows) if rep_lows else None
         for i, s in steps.items():
-            if (i not in covered and kinds.get(i) == "rep"
-                    and s.get("duration_type") == "open"
-                    and s.get("intensity") == "active"):
+            if i in covered or kinds.get(i) != "rep":
+                continue
+            is_open = (s.get("duration_type") == "open"
+                       and s.get("intensity") == "active")
+            # Garmin suggested workouts type the warmup as a distance step
+            # with an easy target band strictly below the rep targets
+            # (verified: warmup 3.30-3.45 m/s vs reps 3.77-4.0).
+            hi = s.get("custom_target_speed_high")
+            slower = ref_low is not None and hi is not None and hi < ref_low
+            if is_open or slower:
                 if i < min(covered):
                     kinds[i] = "warmup"
                 elif i > max(covered):

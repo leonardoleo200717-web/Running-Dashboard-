@@ -33,6 +33,7 @@ def process_activity(activity: dict) -> tuple[int, bool, dict]:
     records = activity.get("records", [])
     pauses = ingest.timer_pauses(activity)
 
+    metrics.backfill_segment_hr(result["segments"], records)
     reps = metrics.rep_table(result["segments"], records)
     kpis = {
         "rep_table": reps,
@@ -49,9 +50,50 @@ def process_activity(activity: dict) -> tuple[int, bool, dict]:
     try:
         session_id, created = store.save_session(
             con, ingest.dedup_key(activity), activity, result, kpis, candidates)
+        # Re-apply per-segment kind overrides after a re-parse.
+        if any(k.startswith("segkind:") for k in store.get_overrides(con, session_id)):
+            _recompute_session(con, session_id)
     finally:
         con.close()
     return session_id, created, result
+
+
+def _stored_segments_and_records(con, session_id):
+    """Stored intervals/records converted back to engine-shaped dicts."""
+    segs = []
+    for s in store.get_intervals(con, session_id):
+        segs.append({**s,
+                     "start_time": store.parse_ts(s["start_time"]),
+                     "end_time": store.parse_ts(s["end_time"]),
+                     "outlier": bool(s["outlier"])})
+    records = [{"timestamp": store.parse_ts(r["ts"]),
+                "distance": r["distance_m"],
+                "enhanced_speed": r["speed_ms"],
+                "heart_rate": r["hr"], "cadence": r["cadence"]}
+               for r in store.get_records(con, session_id)]
+    return segs, records
+
+
+def _recompute_session(con, session_id):
+    """Rebuild structure and KPIs from the (override-applied) stored
+    segments, so per-segment reclassification updates everything."""
+    import json
+    segs, records = _stored_segments_and_records(con, session_id)
+    reps = metrics.rep_table(segs, records)
+    kpis = {
+        "rep_table": reps,
+        "drift": metrics.intra_set_drift(reps),
+        "recovery": metrics.recovery_quality(segs, records),
+        "pace_at_hr": metrics.pace_at_hr(records),
+        "hr_at_pace": metrics.hr_at_pace(records),
+        "intensity": None,
+    }
+    structure = intervals.structure_string(segs)
+    con.execute(
+        "UPDATE sessions SET structure = ?, kpis_json = ?, needs_manual_tag = 0"
+        " WHERE id = ?",
+        (structure, json.dumps(kpis, default=str), session_id))
+    con.commit()
 
 
 # ------------------------------------------------------------ template helpers
@@ -212,7 +254,32 @@ def session_detail(session_id):
         })
     return render_template("session.html", session=session, segments=segs,
                            series=series, phases=phases, similar=similar,
-                           cluster_idx=cluster_idx)
+                           cluster_idx=cluster_idx, segment_kinds=_SEGMENT_KINDS)
+
+
+_SEGMENT_KINDS = {"rep": "Active", "recovery": "Recovery",
+                  "warmup": "WU", "cooldown": "CD"}
+
+
+@app.route("/session/<int:session_id>/segment", methods=["POST"])
+def segment_override(session_id):
+    seq = request.form.get("seq", type=int)
+    kind = request.form.get("kind")
+    if seq is None or kind not in _SEGMENT_KINDS:
+        return "Bad request", 400
+    con = db()
+    try:
+        row = con.execute(
+            "SELECT start_time FROM intervals WHERE session_id = ? AND seq = ?",
+            (session_id, seq)).fetchone()
+        if row is None:
+            return "Not found", 404
+        store.set_override(con, session_id, f"segkind:{row['start_time']}", kind)
+        _recompute_session(con, session_id)
+    finally:
+        con.close()
+    flash("Segment reclassified — structure and KPIs recomputed.")
+    return redirect(url_for("session_detail", session_id=session_id))
 
 
 @app.route("/session/<int:session_id>/override", methods=["POST"])
@@ -260,6 +327,43 @@ def trends():
                            pace_band=metrics.DEFAULT_PACE_BAND_S)
 
 
+@app.route("/predictor")
+def predictor():
+    from datetime import timedelta
+    window_days = 120
+    con = db()
+    try:
+        sessions = store.list_sessions(con)
+        bests: dict[int, dict] = {}
+        latest = store.parse_ts(sessions[0]["start_time_utc"]) if sessions else None
+        for s in sessions:
+            dt = store.parse_ts(s["start_time_utc"])
+            if dt is None or (latest - dt).days > window_days:
+                continue
+            _, records = _stored_segments_and_records(con, s["id"])
+            for d, t in metrics.best_efforts(records).items():
+                if d not in bests or t < bests[d]["t"]:
+                    bests[d] = {"t": t, "session_id": s["id"],
+                                "date": (s["start_time_utc"] or "")[:10]}
+    finally:
+        con.close()
+
+    # Anchor: the longest solid best effort (longer anchors predict long
+    # races far better than short ones).
+    anchor = None
+    for d in (10000, 5000, 3000, 1609, 1000):
+        if d in bests:
+            anchor = {"d": d, **bests[d]}
+            break
+    predictions, vdot = [], None
+    if anchor:
+        predictions = metrics.race_predictions(anchor["t"], anchor["d"])
+        vdot = round(metrics.vdot_from(anchor["t"], anchor["d"]), 1)
+    return render_template("predictor.html", bests=bests, anchor=anchor,
+                           predictions=predictions, vdot=vdot,
+                           window_days=window_days)
+
+
 @app.route("/clusters")
 def clusters_page():
     con = db()
@@ -294,11 +398,13 @@ def cluster_detail(cluster_idx):
             sel = [s for s in segs if (s["timer_s"] or 0) > 60][:30]
         paces = [round(metrics.pace_s_per_km(s["avg_speed_ms"]), 1)
                  if s["avg_speed_ms"] else None for s in sel]
+        hrs = [round(s["avg_hr"]) if s.get("avg_hr") else None for s in sel]
         overlay.append({
             "session_id": m["session"]["id"],
             "date": (m["session"]["start_time_utc"] or "")[:10],
             "structure": m["session"].get("structure"),
             "paces": paces,
+            "hrs": hrs,
         })
     x_max = max((len(o["paces"]) for o in overlay), default=0)
     return render_template("cluster.html", cluster=cluster,

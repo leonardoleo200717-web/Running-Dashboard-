@@ -6,7 +6,10 @@
 — pace per {{ x_label | lower }}, one line per session (newest 8 shown).
 <a href="{{ url_for('clusters_page') }}">← all groups</a></p>
 
+<h2>Pace (min/km)</h2>
 <div class="card"><div class="chart-box tall"><canvas id="overlay"></canvas></div></div>
+<h2>Heart rate (bpm)</h2>
+<div class="card"><div class="chart-box"><canvas id="overlayHr"></canvas></div></div>
 
 <div class="card">
   <table>
@@ -64,6 +67,22 @@
       borderWidth: 2, pointRadius: 4, pointHoverRadius: 6, spanGaps: true,
     }))},
     options: o,
+  });
+
+  // Same sessions, same colors: HR per rep on its own axis below.
+  const oh = baseOptions(c);
+  oh.scales.x.title = { display: true, text: '{{ x_label }} #', color: c.muted };
+  oh.plugins.legend = { display: true, labels: { boxWidth: 12, boxHeight: 12 } };
+  oh.plugins.tooltip = { callbacks: {
+    label: ctx => ' ' + ctx.dataset.label + ' ' + ctx.parsed.y + ' bpm' } };
+  new Chart(document.getElementById('overlayHr'), {
+    type: 'line',
+    data: { labels, datasets: overlay.map((s, i) => ({
+      label: s.date, data: s.hrs,
+      borderColor: c.cats[i % 8], backgroundColor: c.cats[i % 8],
+      borderWidth: 2, pointRadius: 4, pointHoverRadius: 6, spanGaps: true,
+    }))},
+    options: oh,
   });
 </script>
 {% endblock %}
