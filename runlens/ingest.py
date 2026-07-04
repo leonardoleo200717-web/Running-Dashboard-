@@ -140,6 +140,15 @@ def _dispatch(activity: dict, name: str, frame) -> None:
 def _finalize(activity: dict) -> None:
     activity["records"].sort(key=lambda r: r["timestamp"])
     activity["laps"].sort(key=lambda l: (l.get("start_time") or _MIN_KEY,))
+    # Garmin-Connect-exported files carry a bogus lap `timestamp` (every
+    # lap reports the session start; verified on real exports). The lap
+    # end is then derived from start + elapsed instead.
+    from datetime import timedelta
+    for lap in activity["laps"]:
+        start, end = lap.get("start_time"), lap.get("timestamp")
+        dur = lap.get("total_elapsed_time") or lap.get("total_timer_time")
+        if start is not None and dur and (end is None or end <= start):
+            lap["timestamp"] = start + timedelta(seconds=dur)
     activity["workout_steps"].sort(key=lambda s: s.get("message_index") or 0)
     splits = activity["splits"]
     if splits and all(s.get("start_time") is not None for s in splits):

@@ -3,15 +3,31 @@
 {% block content %}
 <h1>Sessions</h1>
 
-<div class="card">
-  <form action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
+<div class="card" id="dropzone">
+  <form action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data"
+        id="upload-form">
     <input type="file" name="fit_files" accept=".fit,.FIT" multiple>
     <button class="primary" type="submit">Import FIT files</button>
-    <span class="muted">Re-uploading the same file is safe (idempotent).</span>
+    <span class="muted">…or drag &amp; drop .FIT files anywhere on this page.
+      Re-uploading the same file is safe (idempotent).</span>
   </form>
 </div>
 
-{% if sessions %}
+{% if n_sessions %}
+<p>
+  <span class="muted">Group by:</span>
+  {% for m in ['week', 'month', 'year'] %}
+    {% if m == mode %}<strong>{{ m }}</strong>{% else %}
+    <a href="{{ url_for('index', group=m) }}">{{ m }}</a>{% endif %}
+    {%- if not loop.last %} · {% endif %}
+  {% endfor %}
+</p>
+
+{% for g in groups %}
+<h2>{{ g.label }}
+  <span class="muted" style="font-weight:400">
+    — {{ g.sessions | length }} session{{ 's' if g.sessions|length != 1 }},
+    {{ g.km }} km, {{ g.timer_s | hms }}</span></h2>
 <div class="card">
   <table>
     <thead>
@@ -21,7 +37,7 @@
       </tr>
     </thead>
     <tbody>
-      {% for s in sessions %}
+      {% for s in g.sessions %}
       <tr>
         <td><a class="rowlink" href="{{ url_for('session_detail', session_id=s.id) }}">
             {{ s.start_time_utc | localdt }}</a></td>
@@ -41,7 +57,47 @@
     </tbody>
   </table>
 </div>
+{% endfor %}
 {% else %}
 <p class="muted">No sessions yet — import your Garmin FIT files above.</p>
 {% endif %}
+{% endblock %}
+
+{% block scripts %}
+<style>
+  body.dragging::after {
+    content: "Drop FIT files to import";
+    position: fixed; inset: 0; display: flex; align-items: center;
+    justify-content: center; font-size: 1.6rem; font-weight: 700;
+    background: color-mix(in srgb, var(--series-pace) 12%, var(--page));
+    border: 3px dashed var(--series-pace); color: var(--ink);
+    z-index: 10; pointer-events: none;
+  }
+</style>
+<script>
+  // Drag & drop import: drop .FIT files anywhere on the page.
+  let dragDepth = 0;
+  document.addEventListener('dragenter', e => {
+    e.preventDefault();
+    if (++dragDepth === 1) document.body.classList.add('dragging');
+  });
+  document.addEventListener('dragleave', e => {
+    if (--dragDepth === 0) document.body.classList.remove('dragging');
+  });
+  document.addEventListener('dragover', e => e.preventDefault());
+  document.addEventListener('drop', async e => {
+    e.preventDefault();
+    dragDepth = 0;
+    document.body.classList.remove('dragging');
+    const files = [...e.dataTransfer.files]
+      .filter(f => f.name.toLowerCase().endsWith('.fit'));
+    if (!files.length) return;
+    const data = new FormData();
+    files.forEach(f => data.append('fit_files', f));
+    const btn = document.querySelector('#upload-form button');
+    btn.disabled = true; btn.textContent = 'Importing…';
+    await fetch('{{ url_for("upload") }}', { method: 'POST', body: data });
+    location.reload();
+  });
+</script>
 {% endblock %}

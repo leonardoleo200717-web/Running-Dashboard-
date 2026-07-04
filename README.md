@@ -43,6 +43,18 @@ FIT ingestion → origin detection → interval engine → metric computation �
   CV ≤ 5 %, no pauses, never a recovery) are auto-detected and *proposed*;
   each point enters the tracker only after one-click confirmation. Seeded
   with the Jun 2025 (4:02/km @ 173) and Jun 2026 (3:52/km @ 175) anchors.
+- **Time blocks** — the session list groups into weekly / monthly / yearly
+  blocks with volume totals; FIT files can be dragged & dropped anywhere
+  on the page to import.
+- **Phase overview** — every session shows warmup / work / recoveries /
+  cooldown with distance, duration, pace and HR.
+- **Trend modeling** — the trends charts carry a 5-point rolling average
+  and a linear-regression fit, plus an "Am I improving?" panel with
+  yes/no verdicts (pace @ HR slope, HR @ pace slope, 4-week volume).
+- **Similar sessions** — fuzzy clustering groups comparable workouts
+  (same rep distances regardless of count, time intervals within ±15 %
+  total work, runs within ±10 % distance) with an overlapped
+  pace-per-rep comparison chart.
 
 ## Layout
 

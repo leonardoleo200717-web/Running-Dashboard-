@@ -35,7 +35,9 @@ from collections import Counter
 from . import origin as origin_mod
 
 # --- junk laps (spec 2.6): double button presses ---
-JUNK_MAX_DURATION_S = 2.0
+# Spec said <2 s; a real file showed a 2.6 s / 8.6 m double-press lap, so
+# the duration threshold is 5 s (nothing legitimate lasts under 5 s).
+JUNK_MAX_DURATION_S = 5.0
 JUNK_MAX_DISTANCE_M = 5.0
 
 # --- normalization (spec 3.1) ---
@@ -189,6 +191,31 @@ def _merge_lap_group(group: list[dict], kind: str) -> dict:
     }
 
 
+def _step_kinds(steps: dict) -> dict:
+    """kind per step index, correcting a verified Garmin quirk: in
+    user-created workouts the warmup/cooldown steps carry the default
+    intensity 'active' (open duration, open target). An open 'active'
+    step outside the repeat block, positioned before it, is the warmup;
+    after it, the cooldown."""
+    kinds = {i: _INTENSITY_TO_KIND.get(s.get("intensity"), "other")
+             for i, s in steps.items()}
+    covered: set[int] = set()
+    for i, s in steps.items():
+        if (s.get("duration_type") == "repeat_until_steps_cmplt"
+                and s.get("duration_step") is not None):
+            covered.update(range(int(s["duration_step"]), i))
+    if covered:
+        for i, s in steps.items():
+            if (i not in covered and kinds.get(i) == "rep"
+                    and s.get("duration_type") == "open"
+                    and s.get("intensity") == "active"):
+                if i < min(covered):
+                    kinds[i] = "warmup"
+                elif i > max(covered):
+                    kinds[i] = "cooldown"
+    return kinds
+
+
 def _level_structured(activity: dict, laps: list[dict]) -> dict | None:
     steps = {s.get("message_index"): s for s in activity.get("workout_steps", [])}
     if not steps:
@@ -196,6 +223,7 @@ def _level_structured(activity: dict, laps: list[dict]) -> dict | None:
     mapped = [l for l in laps if l.get("wkt_step_index") is not None]
     if not mapped:
         return None
+    kinds_by_step = _step_kinds(steps)
 
     # Group consecutive laps sharing a wkt_step_index: same step execution.
     # Repeated steps (8x400: every rep is index 1) never merge because a
@@ -213,10 +241,7 @@ def _level_structured(activity: dict, laps: list[dict]) -> dict | None:
     for group in groups:
         idx = group[0].get("wkt_step_index")
         step = steps.get(idx)
-        if step is None:
-            kind = "other"
-        else:
-            kind = _INTENSITY_TO_KIND.get(step.get("intensity"), "other")
+        kind = kinds_by_step.get(idx, "other") if step is not None else "other"
         seg = _merge_lap_group(group, kind)
         # Structured steps say exactly how they're defined: a time-based
         # step must be labeled by time even if its meters happen to snap
@@ -522,9 +547,28 @@ def _rep_label(group: list[dict]) -> str:
     no count prefix: '15'' reads better than '1x15''."""
     n = f"{len(group)}x" if len(group) > 1 else ""
     snaps = [_seg_snap(s) for s in group]
-    if all(snaps) and len(set(snaps)) == 1:
-        return f"{n}{snaps[0]}m"
+    non_null = [s for s in snaps if s]
+    # Majority snap covers one corrupted rep (a 6x1000 where rep 1 was
+    # pressed late and measured 901 m is still "6x1000m").
+    if (non_null and len(set(non_null)) == 1
+            and len(non_null) >= 0.8 * len(group)):
+        return f"{n}{non_null[0]}m"
+
     durations = [s["timer_s"] for s in group if s["timer_s"]]
+    dists = [s["distance_m"] for s in group if s["distance_m"]]
+    hint_time = any(s.get("duration_hint") == "time" for s in group)
+
+    # Neither snap nor exact duration: pick the dimension the runner kept
+    # constant. Strides measured 101-111 m in 22-24 s are "5x100m" (distance
+    # tighter); 276-315 m reps in 59-62 s are "15x1'" (time tighter). Only
+    # applies when distances really are tight — a heterogeneous set like
+    # 400+300+200 must fall through to per-rep labels.
+    if (not hint_time and dists and durations
+            and _cv(dists) <= 0.08 and _cv(dists) < _cv(durations)):
+        med_snap = snap_distance(statistics.median(dists), 0.10)
+        if med_snap:
+            return f"{n}{med_snap}m"
+
     if durations:
         modal = _modal(durations, bucket=5.0)
         if modal and all(abs(d - modal) <= max(3, 0.05 * modal) for d in durations):
@@ -558,8 +602,15 @@ def _recovery_label(recoveries: list[dict], prefix: str = "R") -> str | None:
         prefer_dist = True
     elif "time" in hints:
         prefer_dist = False
+    elif not dists:
+        prefer_dist = False
+    elif not durs or _cv(dists) < _cv(durs):
+        prefer_dist = True
     else:
-        prefer_dist = bool(dists) and (not durs or _cv(dists) < _cv(durs))
+        # Tie (both dimensions equally steady): distance wins if it reads
+        # as a canonical jog length, otherwise time.
+        prefer_dist = (_cv(dists) == _cv(durs)
+                       and snap_distance(statistics.median(dists), 0.08) is not None)
 
     if prefer_dist and dists:
         snap = snap_distance(statistics.median(dists), RECOVERY_SNAP_TOLERANCE)
@@ -589,7 +640,14 @@ def _group_reps(reps: list[dict]) -> list[list[dict]]:
             # because some distances happen to snap and others don't.
             same_time = (rep["timer_s"] and prev["timer_s"]
                          and abs(rep["timer_s"] - prev["timer_s"]) <= max(3, 0.05 * prev["timer_s"]))
-            if same_dist or same_time:
+            # Same effort, slightly short measurement: a 901 m rep at the
+            # same pace as its 1000 m neighbours belongs with them.
+            similar_pace = (rep["avg_speed_ms"] and prev["avg_speed_ms"]
+                            and abs(rep["avg_speed_ms"] - prev["avg_speed_ms"])
+                            <= 0.08 * prev["avg_speed_ms"])
+            close_time = (rep["timer_s"] and prev["timer_s"]
+                          and abs(rep["timer_s"] - prev["timer_s"]) <= 0.15 * prev["timer_s"])
+            if same_dist or same_time or (similar_pace and close_time):
                 groups[-1].append(rep)
                 continue
         groups.append([rep])
@@ -624,7 +682,7 @@ def structure_string(segments: list[dict]) -> str | None:
         ds = sorted((r["timer_s"] or 0) for r in inner)
         gap, gap_i = max((ds[i + 1] - ds[i], i) for i in range(len(ds) - 1))
         short_median = statistics.median(ds[:gap_i + 1])
-        if gap >= max(30, short_median):
+        if gap >= max(30, short_median) and ds[gap_i + 1] >= 60:
             cut = (ds[gap_i] + ds[gap_i + 1]) / 2
             set_recs = [r for r in inner if (r["timer_s"] or 0) > cut]
             normal_recs = [r for r in inner if (r["timer_s"] or 0) <= cut]
@@ -638,9 +696,18 @@ def structure_string(segments: list[dict]) -> str | None:
             elif seg["kind"] == "rep":
                 sets[-1].append(seg)
         sets = [s for s in sets if s]
-        labels = {_rep_label(s) for s in sets}
-        if len(sets) > 1 and len(labels) == 1:
-            base = f"{len(sets)}x({labels.pop()})"
+        labels = [_rep_label(s) for s in sets]
+        top_label, top_n = Counter(labels).most_common(1)[0]
+        majority_size = max(len(s) for s, l in zip(sets, labels) if l == top_label)
+        # Uniform sets, or a majority of identical sets where the others
+        # are truncated (real 5x(400+300+200) file: rep 1 of set 1 was
+        # botched, leaving one set as just 300+200 — still 5 sets).
+        uniform = top_n == len(sets)
+        majority = (top_n >= 0.5 * len(sets)
+                    and all(len(s) < majority_size
+                            for s, l in zip(sets, labels) if l != top_label))
+        if len(sets) > 1 and (uniform or majority):
+            base = f"{len(sets)}x({top_label})"
             r = _recovery_label(normal_recs, "R")
             sr = _recovery_label(set_recs, "SR")
             return " ".join(p for p in (base, r, sr) if p)
@@ -653,8 +720,10 @@ def structure_string(segments: list[dict]) -> str | None:
 
 # ------------------------------------------------------------ classification
 
-LONG_RUN_MIN_M = 15000
-LONG_RUN_MIN_S = 80 * 60
+# Calibrated on real sessions: 75' easy runs reach ~17.5 km; true long
+# runs are 20+ km / 100'+. Always user-overridable.
+LONG_RUN_MIN_M = 18000
+LONG_RUN_MIN_S = 95 * 60
 
 
 def classify_session(activity: dict, result: dict) -> str:
@@ -665,13 +734,21 @@ def classify_session(activity: dict, result: dict) -> str:
         return "race"
 
     reps = [s for s in result["segments"] if s["kind"] == "rep" and not s["outlier"]]
+
+    # Strides tacked onto an easy run (5x100m after 75' easy) don't make
+    # it an interval session: reps must be a meaningful share of the work.
+    session_timer = session.get("total_timer_time") or 0
+    rep_timer = sum(s["timer_s"] or 0 for s in reps)
+    if reps and session_timer and rep_timer / session_timer < 0.05:
+        reps = []
+
     if reps:
         # Fartlek: interval-ish but irregular (no clean structure string groups)
         if result.get("detection_source") == "lap_inference":
             snaps = [snap_distance(r["distance_m"]) for r in reps]
             durs = [r["timer_s"] for r in reps if r["timer_s"]]
             modal = _modal(durs, bucket=5.0)
-            regular_time = modal and all(abs(d - modal) <= max(5, 0.1 * modal) for d in durs)
+            regular_time = modal and all(abs(d - modal) <= max(5, 0.15 * modal) for d in durs)
             regular_dist = all(snaps) and len(set(snaps)) <= 3
             if not regular_time and not regular_dist:
                 return "fartlek"

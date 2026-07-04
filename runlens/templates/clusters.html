@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}RunLens — Similar sessions{% endblock %}
+{% block content %}
+<h1>Similar sessions</h1>
+<p class="muted">Sessions fuzzy-matched into comparable groups: same rep
+distances regardless of count (6x1km with 8x1km), time intervals within
+±15% total work (3x12' with 4x10'), runs within ±10% distance
+(20 km with 22 km).</p>
+
+{% set ns = namespace(multi=0) %}
+{% for c in clusters %}
+{% if c.members | length > 1 %}
+{% set ns.multi = ns.multi + 1 %}
+<h2>{{ c.label }}
+  <span class="muted" style="font-weight:400">— {{ c.members | length }} sessions ·
+  <a href="{{ url_for('cluster_detail', cluster_idx=loop.index0) }}">compare overlapped</a></span>
+</h2>
+<div class="card">
+  <table>
+    <thead><tr><th>Date</th><th>Type</th><th>Structure</th><th>Distance</th>
+               <th>Time</th><th>Avg HR</th></tr></thead>
+    <tbody>
+    {% for m in c.members %}{% set s = m.session %}
+      <tr>
+        <td><a class="rowlink" href="{{ url_for('session_detail', session_id=s.id) }}">
+            {{ s.start_time_utc | localdt }}</a></td>
+        <td>{{ s.session_type }}</td>
+        <td>{{ s.structure or '—' }}</td>
+        <td>{{ s.total_distance_m | km }}</td>
+        <td>{{ s.total_timer_s | hms }}</td>
+        <td>{{ s.avg_hr | round(0) | int if s.avg_hr else '–' }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endfor %}
+
+{% if ns.multi == 0 %}
+<p class="muted">No groups with more than one session yet — import more files.</p>
+{% endif %}
+{% endblock %}

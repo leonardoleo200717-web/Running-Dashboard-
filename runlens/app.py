@@ -86,14 +86,47 @@ def pace_filter(seconds_per_km):
 
 # ------------------------------------------------------------ routes
 
+_GROUP_MODES = ("week", "month", "year")
+
+
+def _group_label(dt, mode: str) -> str:
+    local = dt.astimezone(DISPLAY_TZ)
+    if mode == "week":
+        iso = local.isocalendar()
+        return f"{iso[0]} · Week {iso[1]:02d}"
+    if mode == "month":
+        return local.strftime("%B %Y")
+    return local.strftime("%Y")
+
+
 @app.route("/")
 def index():
+    mode = request.args.get("group", "week")
+    if mode not in _GROUP_MODES:
+        mode = "week"
     con = db()
     try:
         sessions = store.list_sessions(con)
     finally:
         con.close()
-    return render_template("index.html", sessions=sessions)
+
+    # Time blocks: sessions grouped into weekly/monthly/yearly buckets,
+    # newest first, each with volume totals.
+    groups: list[dict] = []
+    for s in sessions:
+        dt = store.parse_ts(s["start_time_utc"])
+        label = _group_label(dt, mode) if dt else "unknown"
+        if not groups or groups[-1]["label"] != label:
+            groups.append({"label": label, "sessions": [],
+                           "km": 0.0, "timer_s": 0.0})
+        g = groups[-1]
+        g["sessions"].append(s)
+        g["km"] += (s.get("total_distance_m") or 0) / 1000
+        g["timer_s"] += s.get("total_timer_s") or 0
+    for g in groups:
+        g["km"] = round(g["km"], 1)
+    return render_template("index.html", groups=groups, mode=mode,
+                           n_sessions=len(sessions))
 
 
 @app.route("/upload", methods=["POST"])
@@ -116,6 +149,33 @@ def upload():
     return redirect(url_for("index"))
 
 
+def _phase_summary(segs: list[dict]) -> dict:
+    """Warmup / work / recovery / cooldown totals for the overview."""
+    phases = {}
+    for key, kinds in (("warmup", ("warmup",)), ("work", ("rep",)),
+                       ("recovery", ("recovery",)), ("cooldown", ("cooldown",))):
+        sel = [s for s in segs if s["kind"] in kinds and not s["outlier"]]
+        if not sel:
+            continue
+        dist = sum(s["distance_m"] or 0 for s in sel)
+        timer = sum(s["timer_s"] or 0 for s in sel)
+        hr_w = [(s["avg_hr"], s["timer_s"] or 0) for s in sel if s["avg_hr"]]
+        hr_t = sum(t for _, t in hr_w)
+        phases[key] = {
+            "n": len(sel),
+            "distance_m": dist,
+            "timer_s": timer,
+            "pace_s_km": metrics.pace_s_per_km(dist / timer) if timer and dist else None,
+            "avg_hr": round(sum(h * t for h, t in hr_w) / hr_t) if hr_t else None,
+        }
+    return phases
+
+
+def _all_cluster_entries(con) -> list[dict]:
+    return [{"session": s, "segments": store.get_intervals(con, s["id"])}
+            for s in store.list_sessions(con)]
+
+
 @app.route("/session/<int:session_id>")
 def session_detail(session_id):
     con = db()
@@ -125,8 +185,19 @@ def session_detail(session_id):
             return "Not found", 404
         segs = store.get_intervals(con, session_id)
         records = store.get_records(con, session_id)
+        clusters = metrics.cluster_sessions(_all_cluster_entries(con))
     finally:
         con.close()
+
+    phases = _phase_summary(segs)
+    similar, cluster_idx = [], None
+    for ci, c in enumerate(clusters):
+        ids = [m["session"]["id"] for m in c["members"]]
+        if session_id in ids and len(ids) > 1:
+            cluster_idx = ci
+            similar = [m["session"] for m in c["members"]
+                       if m["session"]["id"] != session_id]
+            break
 
     # 1 Hz series for the pace/HR charts, downsampled for the wire (~600 pts).
     step = max(1, len(records) // 600)
@@ -140,7 +211,8 @@ def session_detail(session_id):
             "hr": r["hr"],
         })
     return render_template("session.html", session=session, segments=segs,
-                           series=series)
+                           series=series, phases=phases, similar=similar,
+                           cluster_idx=cluster_idx)
 
 
 @app.route("/session/<int:session_id>/override", methods=["POST"])
@@ -177,10 +249,62 @@ def trends():
         con.close()
     points_hr.sort(key=lambda p: p["date"])
     points_pace.sort(key=lambda p: p["date"])
+    trend_hr = metrics.trend_series(points_hr)
+    trend_pace = metrics.trend_series(points_pace)
+    stats = metrics.improvement_stats(points_hr, points_pace, weekly)
     return render_template("trends.html", points_hr=points_hr,
                            points_pace=points_pace, weekly=weekly,
+                           trend_hr=trend_hr, trend_pace=trend_pace,
+                           stats=stats,
                            hr_band=metrics.DEFAULT_HR_BAND,
                            pace_band=metrics.DEFAULT_PACE_BAND_S)
+
+
+@app.route("/clusters")
+def clusters_page():
+    con = db()
+    try:
+        clusters = metrics.cluster_sessions(_all_cluster_entries(con))
+    finally:
+        con.close()
+    return render_template("clusters.html", clusters=clusters)
+
+
+@app.route("/clusters/<int:cluster_idx>")
+def cluster_detail(cluster_idx):
+    con = db()
+    try:
+        clusters = metrics.cluster_sessions(_all_cluster_entries(con))
+    finally:
+        con.close()
+    if cluster_idx < 0 or cluster_idx >= len(clusters):
+        return "Not found", 404
+    cluster = clusters[cluster_idx]
+
+    # Overlay series: rep paces per session for interval clusters, km-lap
+    # paces for run clusters. Capped at 8 sessions (the categorical
+    # palette's fixed slot count) — newest 8 win.
+    members = cluster["members"][-8:]
+    overlay = []
+    for m in members:
+        segs = m["segments"]
+        if cluster["kind"] in ("dist", "time"):
+            sel = [s for s in segs if s["kind"] == "rep" and not s["outlier"]]
+        else:
+            sel = [s for s in segs if (s["timer_s"] or 0) > 60][:30]
+        paces = [round(metrics.pace_s_per_km(s["avg_speed_ms"]), 1)
+                 if s["avg_speed_ms"] else None for s in sel]
+        overlay.append({
+            "session_id": m["session"]["id"],
+            "date": (m["session"]["start_time_utc"] or "")[:10],
+            "structure": m["session"].get("structure"),
+            "paces": paces,
+        })
+    x_max = max((len(o["paces"]) for o in overlay), default=0)
+    return render_template("cluster.html", cluster=cluster,
+                           cluster_idx=cluster_idx, overlay=overlay,
+                           x_max=x_max,
+                           x_label="Rep" if cluster["kind"] in ("dist", "time") else "Segment")
 
 
 @app.route("/progression")

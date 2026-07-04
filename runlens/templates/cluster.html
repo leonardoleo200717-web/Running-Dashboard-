@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}RunLens — Compare: {{ cluster.label }}{% endblock %}
+{% block content %}
+<h1>Compare: {{ cluster.label }}</h1>
+<p class="muted">{{ cluster.members | length }} similar sessions overlapped
+— pace per {{ x_label | lower }}, one line per session (newest 8 shown).
+<a href="{{ url_for('clusters_page') }}">← all groups</a></p>
+
+<div class="card"><div class="chart-box tall"><canvas id="overlay"></canvas></div></div>
+
+<div class="card">
+  <table>
+    <thead><tr><th></th><th>Date</th><th>Structure</th><th>Avg rep pace</th></tr></thead>
+    <tbody>
+    {% for o in overlay %}
+      <tr>
+        <td><span class="swatch" data-slot="{{ loop.index0 }}"></span></td>
+        <td><a class="rowlink" href="{{ url_for('session_detail', session_id=o.session_id) }}">
+            {{ o.date }}</a></td>
+        <td>{{ o.structure or '—' }}</td>
+        <td data-avg="{{ loop.index0 }}">–</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<style>
+  .swatch { display:inline-block; width: 14px; height: 14px; border-radius: 4px; }
+</style>
+<script>
+  const c = vizColors();
+  const overlay = {{ overlay | tojson }};
+  const xMax = {{ x_max }};
+  const labels = Array.from({length: xMax}, (_, i) => i + 1);
+
+  // Color follows the session (fixed categorical slots, never cycled).
+  document.querySelectorAll('.swatch').forEach(el => {
+    el.style.background = c.cats[+el.dataset.slot % 8];
+  });
+  overlay.forEach((o, i) => {
+    const paces = o.paces.filter(p => p != null);
+    if (paces.length) {
+      const avg = paces.reduce((a, b) => a + b, 0) / paces.length;
+      const cell = document.querySelector(`[data-avg="${i}"]`);
+      if (cell) cell.textContent = fmtPace(avg);
+    }
+  });
+
+  const o = baseOptions(c);
+  o.scales.y.reverse = true;
+  o.scales.y.ticks = { callback: v => fmtPace(v) };
+  o.scales.x.title = { display: true, text: '{{ x_label }} #', color: c.muted };
+  o.plugins.legend = { display: true, labels: { boxWidth: 12, boxHeight: 12 } };
+  o.plugins.tooltip = { callbacks: {
+    label: ctx => ' ' + ctx.dataset.label + ' ' + fmtPace(ctx.parsed.y) } };
+  new Chart(document.getElementById('overlay'), {
+    type: 'line',
+    data: { labels, datasets: overlay.map((s, i) => ({
+      label: s.date, data: s.paces,
+      borderColor: c.cats[i % 8], backgroundColor: c.cats[i % 8],
+      borderWidth: 2, pointRadius: 4, pointHoverRadius: 6, spanGaps: true,
+    }))},
+    options: o,
+  });
+</script>
+{% endblock %}

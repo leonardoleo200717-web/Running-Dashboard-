@@ -216,14 +216,114 @@ def test_time_labels_absorb_measurement_noise():
             60.1, 59.6, 61.0, 61.0, 61.4, 60.0, 59.1]
     dists = [284.8, 278.5, 276.8, 286.8, 300.3, 279.9, 299.5, 290.3,
              276.4, 292.6, 302.5, 314.7, 307.0, 290.0, 287.7]
-    for dur, dist in zip(durs, dists):
+    rec_dists = [173.5, 176.4, 163.6, 159.8, 171.3, 159.9, 170.0, 124.6,
+                 148.8, 127.1, 133.6, 134.8, 122.8, 114.2, 150.0]
+    for i, (dur, dist) in enumerate(zip(durs, dists)):
         b.lap(dur, dist, hr=170, trigger="manual")
-        b.lap(60.4, 150, hr=155, trigger="manual")
+        b.lap(60.4, rec_dists[i], hr=155, trigger="manual")
     b.lap(340, 1000, hr=145, trigger="distance")
     result = intervals.resolve(b.done())
     reps = reps_of(result)
     assert len(reps) == 15
     assert result["structure"] == "15x1' R1'"
+
+
+# --- real-file regressions (sessions of 2026-05-26, 04-02, 04-23, 04-26) ---
+
+def test_nested_sets_with_botched_first_rep():
+    """Real 5x(400+300+200) file: rep 1 was pressed late (644 m at slower
+    pace, demoted); the remaining 4 complete + 1 truncated sets must still
+    read as 5 sets."""
+    b = _free_builder(26)
+    b.lap(300, 1000, hr=132, trigger="distance")
+    b.lap(295, 1000, hr=142, trigger="distance")
+    b.lap(155, 645, hr=154, trigger="manual")          # botched first 400
+    first = True
+    for i in range(5):
+        if not first:
+            b.lap(84 - i, 400 + 3 * i, hr=170, trigger="manual")
+        first = False
+        b.lap(46, 105, hr=160, trigger="manual")       # p100
+        b.lap(60 - i, 300 + 2 * i, hr=170, trigger="manual")
+        b.lap(50, 103, hr=163, trigger="manual")       # p100
+        b.lap(38, 204, hr=172, trigger="manual")
+        if i < 4:
+            b.lap(170, 420, hr=145, trigger="manual")  # p400 set recovery
+    b.lap(310, 1000, hr=150, trigger="distance")
+    result = intervals.resolve(b.done())
+    assert result["structure"] == "5x(400m + 300m + 200m) R100m SR400m"
+    assert result["session_type"] == "intervals"
+
+
+def test_short_first_rep_and_sub5s_junk():
+    """Real 6x1000 file: rep 1 measured 901 m / 206 s (late press) and a
+    2.6 s / 8.6 m double-press lap sits mid-block. Junk must go, rep 1
+    must group with its 1000 m neighbours."""
+    b = _free_builder(2)
+    for d in (293, 298, 299, 267):
+        b.lap(d, 1000, hr=150, trigger="distance")     # warmup (last one brisk)
+    b.lap(206.5, 901.5, hr=172, trigger="manual")      # rep 1, short
+    b.lap(79.8, 214.5, hr=148, trigger="manual")
+    b.lap(230.7, 1000, hr=173, trigger="distance")
+    b.lap(2.6, 8.6, hr=178, trigger="manual")          # double press
+    recs = ((89.2, 208.4), (93.0, 220.1), (81.5, 211.2), (89.4, 215.1))
+    for (rd, rm), d in zip(recs, (226.9, 227.3, 229.5, 229.4)):
+        b.lap(rd, rm, hr=151, trigger="manual")
+        b.lap(d, 1000 if d != 229.4 else 999.6, hr=173, trigger="distance")
+    b.lap(321, 1000, hr=138, trigger="distance")
+    result = intervals.resolve(b.done())
+    reps = reps_of(result)
+    assert len(reps) == 6
+    assert result["structure"] == "6x1000m R200m"
+    assert result["session_type"] == "intervals"
+
+
+def test_strides_do_not_make_an_easy_run_intervals():
+    """Real easy-75'-plus-5x100m file: strides are detected and labeled,
+    but 115 s of reps in an 80' run is still an easy run."""
+    b = _free_builder(23)
+    for _ in range(11):
+        b.lap(286, 1000, hr=150, trigger="distance")
+    b.lap(101, 344, hr=155, trigger="manual")
+    for i in range(5):
+        b.lap(22 + 0.5 * i, 104 + i, hr=168, trigger="manual")   # stride
+        b.lap(28.5, 105, hr=171, trigger="manual")               # float back
+    for _ in range(3):
+        b.lap(286, 1000, hr=156, trigger="distance")
+    result = intervals.resolve(b.done())
+    assert result["structure"] == "5x100m R100m"
+    assert result["session_type"] == "easy"
+
+
+def test_user_created_workout_warmup_cooldown_marked_active():
+    """Real 5x1.5km p3' file: user-created workouts carry
+    intensity='active' on the open warmup/cooldown steps, and autolap
+    splits each 1500 m step into 1000+500 laps."""
+    from runlens.tests.fixtures import Builder
+    from datetime import datetime, timezone
+    b = Builder(datetime(2026, 4, 26, 8, 48, tzinfo=timezone.utc),
+                structured=True, wkt_name="5x1.5km p3'")
+    b.step(duration_type="open", intensity="active", target_type="open")     # warmup!
+    b.step(duration_type="distance", duration_distance=1500, intensity="active",
+           target_type="speed")
+    b.step(duration_type="time", duration_time=180, intensity="recovery")
+    b.step(duration_type="repeat_until_steps_cmplt", duration_step=1, repeat_steps=5)
+    b.step(duration_type="open", intensity="active", target_type="open")     # cooldown!
+    for _ in range(4):
+        b.lap(280, 1000, hr=155, trigger="distance", wkt_step_index=0)
+    for _ in range(5):
+        b.lap(226, 1000, hr=185, trigger="distance", wkt_step_index=1)
+        b.lap(112, 500, hr=188, trigger="distance", wkt_step_index=1)
+        b.lap(180, 600, hr=168, trigger="time", wkt_step_index=2)
+    for _ in range(5):
+        b.lap(275, 1000, hr=162, trigger="distance", wkt_step_index=4)
+    result = intervals.resolve(b.done())
+    reps = reps_of(result)
+    assert len(reps) == 5
+    assert all(r["distance_m"] == pytest.approx(1500) for r in reps)
+    assert result["structure"] == "5x1500m R3'"
+    kinds = [s["kind"] for s in result["segments"]]
+    assert kinds[0] == "warmup" and kinds[-1] == "cooldown"
 
 
 # --- every session records provenance ---

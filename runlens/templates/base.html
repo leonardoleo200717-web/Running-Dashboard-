@@ -16,6 +16,9 @@
     --series-pace: #2a78d6;   /* categorical slot 1 (blue) */
     --series-hr: #e34948;     /* categorical slot 6 (red) */
     --series-vol: #2a78d6;
+    /* full categorical palette (fixed order, never cycled) */
+    --cat-1: #2a78d6; --cat-2: #1baf7a; --cat-3: #eda100; --cat-4: #008300;
+    --cat-5: #4a3aa7; --cat-6: #e34948; --cat-7: #e87ba4; --cat-8: #eb6834;
     --status-good: #0ca30c; --status-warn: #fab219; --status-crit: #d03b3b;
     --good-text: #006300;
   }
@@ -28,6 +31,8 @@
       --series-pace: #3987e5;
       --series-hr: #e66767;
       --series-vol: #3987e5;
+      --cat-1: #3987e5; --cat-2: #199e70; --cat-3: #c98500; --cat-4: #008300;
+      --cat-5: #9085e9; --cat-6: #e66767; --cat-7: #d55181; --cat-8: #d95926;
       --good-text: #0ca30c;
     }
   }
@@ -104,6 +109,7 @@
   <a href="{{ url_for('index') }}">Sessions</a>
   <a href="{{ url_for('trends') }}">Trends</a>
   <a href="{{ url_for('progression') }}">Progression</a>
+  <a href="{{ url_for('clusters_page') }}">Similar sessions</a>
 </nav>
 <main>
   {% with messages = get_flashed_messages() %}
@@ -118,15 +124,17 @@
   // light/dark values swap in one place.
   function vizColors() {
     const s = getComputedStyle(document.documentElement);
+    const get = (name) => s.getPropertyValue(name).trim();
     return {
-      pace: s.getPropertyValue('--series-pace').trim(),
-      hr: s.getPropertyValue('--series-hr').trim(),
-      vol: s.getPropertyValue('--series-vol').trim(),
-      ink: s.getPropertyValue('--ink-2').trim(),
-      muted: s.getPropertyValue('--muted').trim(),
-      grid: s.getPropertyValue('--grid').trim(),
-      baseline: s.getPropertyValue('--baseline').trim(),
-      surface: s.getPropertyValue('--surface').trim(),
+      pace: get('--series-pace'),
+      hr: get('--series-hr'),
+      vol: get('--series-vol'),
+      cats: [1,2,3,4,5,6,7,8].map(i => get('--cat-' + i)),
+      ink: get('--ink-2'),
+      muted: get('--muted'),
+      grid: get('--grid'),
+      baseline: get('--baseline'),
+      surface: get('--surface'),
     };
   }
   function baseOptions(c) {

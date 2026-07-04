@@ -23,6 +23,30 @@
     <div class="value">{{ session.avg_hr | round(0) | int if session.avg_hr else '–' }}</div></div>
 </div>
 
+{% if phases %}
+<h2>Phases</h2>
+<div class="card">
+  <table>
+    <thead><tr><th>Phase</th><th>Distance</th><th>Duration</th><th>Pace</th><th>Avg HR</th></tr></thead>
+    <tbody>
+      {% for key, label in [('warmup','Warmup'), ('work','Work (reps)'),
+                            ('recovery','Recoveries'), ('cooldown','Cooldown')] %}
+      {% if phases.get(key) %}{% set p = phases[key] %}
+      <tr>
+        <td><strong>{{ label }}</strong>{% if key in ('work','recovery') %}
+            <span class="muted">×{{ p.n }}</span>{% endif %}</td>
+        <td>{{ p.distance_m | km }}</td>
+        <td>{{ p.timer_s | hms }}</td>
+        <td>{{ p.pace_s_km | pace }}</td>
+        <td>{{ p.avg_hr if p.avg_hr else '–' }}</td>
+      </tr>
+      {% endif %}
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
 {% set reps = session.kpis.rep_table or [] %}
 {% if reps %}
 <h2>Rep table</h2>
@@ -62,6 +86,28 @@
 <div class="card"><div class="chart-box"><canvas id="paceChart"></canvas></div></div>
 <h2>Heart rate</h2>
 <div class="card"><div class="chart-box"><canvas id="hrChart"></canvas></div></div>
+{% endif %}
+
+{% if similar %}
+<h2>Similar sessions</h2>
+<div class="card">
+  <p class="muted">Fuzzy-matched by workout equivalence —
+    <a href="{{ url_for('cluster_detail', cluster_idx=cluster_idx) }}">compare them overlapped</a>.</p>
+  <table>
+    <thead><tr><th>Date</th><th>Structure</th><th>Distance</th><th>Avg HR</th></tr></thead>
+    <tbody>
+    {% for s in similar %}
+      <tr>
+        <td><a class="rowlink" href="{{ url_for('session_detail', session_id=s.id) }}">
+            {{ s.start_time_utc | localdt }}</a></td>
+        <td>{{ s.structure or s.session_type }}</td>
+        <td>{{ s.total_distance_m | km }}</td>
+        <td>{{ s.avg_hr | round(0) | int if s.avg_hr else '–' }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
 {% endif %}
 
 <h2>Manual override</h2>

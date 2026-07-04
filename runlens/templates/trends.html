@@ -5,6 +5,53 @@
 <p class="muted">Aerobic efficiency toward the 2h43 goal: pace at fixed HR,
 HR at fixed pace, weekly volume.</p>
 
+<h2>Am I improving?</h2>
+<div class="stat-row">
+  <div class="stat">
+    <div class="label">Overall</div>
+    <div class="value">
+      {% if stats.improving is none %}<span class="muted">not enough data</span>
+      {% elif stats.improving %}<span style="color:var(--good-text)">✔ YES</span>
+      {% else %}<span style="color:var(--status-crit)">✘ NO</span>{% endif %}
+    </div>
+  </div>
+  <div class="stat">
+    <div class="label">Pace @ HR {{ hr_band[0] }}–{{ hr_band[1] }}</div>
+    <div class="value">
+      {% if stats.pace_at_hr_slope_30d is none %}<span class="muted">–</span>
+      {% else %}{{ '%+.1f' | format(stats.pace_at_hr_slope_30d) }} s/km
+        <span class="muted" style="font-size:.8rem">/30d</span>
+        {% if stats.pace_at_hr_improving %}<span style="color:var(--good-text)">✔</span>
+        {% else %}<span style="color:var(--status-crit)">✘</span>{% endif %}
+      {% endif %}
+    </div>
+  </div>
+  <div class="stat">
+    <div class="label">HR @ pace</div>
+    <div class="value">
+      {% if stats.hr_at_pace_slope_30d is none %}<span class="muted">–</span>
+      {% else %}{{ '%+.1f' | format(stats.hr_at_pace_slope_30d) }} bpm
+        <span class="muted" style="font-size:.8rem">/30d</span>
+        {% if stats.hr_at_pace_improving %}<span style="color:var(--good-text)">✔</span>
+        {% else %}<span style="color:var(--status-crit)">✘</span>{% endif %}
+      {% endif %}
+    </div>
+  </div>
+  <div class="stat">
+    <div class="label">Volume (4wk vs prev 4wk)</div>
+    <div class="value">
+      {% if stats.volume_change_pct is none %}<span class="muted">–</span>
+      {% else %}{{ '%+.0f%%' | format(stats.volume_change_pct) }}
+        {% if stats.volume_increasing %}<span style="color:var(--good-text)">▲</span>
+        {% else %}<span style="color:var(--status-crit)">▼</span>{% endif %}
+      {% endif %}
+    </div>
+  </div>
+</div>
+<p class="muted" style="font-size:.85rem">Improving = the regression slope of
+pace @ HR falls &gt; 0.5 s/km per 30 days, or HR @ pace falls &gt; 0.3 bpm per
+30 days. Charts show the data, a 5-point rolling average, and the linear fit.</p>
+
 <h2>Pace @ HR {{ hr_band[0] }}–{{ hr_band[1] }} bpm</h2>
 <div class="card">
   {% if points_hr %}
@@ -33,33 +80,53 @@ HR at fixed pace, weekly volume.</p>
   const pointsHr = {{ points_hr | tojson }};
   const pointsPace = {{ points_pace | tojson }};
   const weekly = {{ weekly | tojson }};
+  const trendHr = {{ trend_hr | tojson }};
+  const trendPace = {{ trend_pace | tojson }};
+
+  // Trend-modeling layers: 5-point rolling average + linear fit.
+  function trendDatasets(trend, color) {
+    const ds = [];
+    if (trend.rolling) ds.push({
+      label: 'Rolling avg (5)', data: trend.rolling,
+      borderColor: color + '80', borderWidth: 2, pointRadius: 0,
+      tension: 0.3,
+    });
+    if (trend.fit) ds.push({
+      label: 'Linear trend', data: trend.fit,
+      borderColor: c.muted, borderDash: [6, 4], borderWidth: 2,
+      pointRadius: 0,
+    });
+    return ds;
+  }
 
   if (pointsHr.length) {
     const o = baseOptions(c);
     o.scales.y.reverse = true;
     o.scales.y.ticks = { callback: v => fmtPace(v) };
-    o.plugins.tooltip = { callbacks: { label: ctx => ' ' + fmtPace(ctx.parsed.y) } };
+    o.plugins.legend = { display: true, labels: { boxWidth: 12, boxHeight: 12 } };
+    o.plugins.tooltip = { callbacks: { label: ctx => ' ' + ctx.dataset.label + ' ' + fmtPace(ctx.parsed.y) } };
     new Chart(document.getElementById('paceAtHr'), {
       type: 'line',
       data: { labels: pointsHr.map(p => p.date), datasets: [{
         label: 'Pace @ HR', data: pointsHr.map(p => p.value),
         borderColor: c.pace, backgroundColor: c.pace,
         borderWidth: 2, pointRadius: 4, pointHoverRadius: 6,
-      }]},
+      }, ...trendDatasets(trendHr, c.pace)]},
       options: o,
     });
   }
 
   if (pointsPace.length) {
     const o = baseOptions(c);
-    o.plugins.tooltip = { callbacks: { label: ctx => ' ' + ctx.parsed.y + ' bpm' } };
+    o.plugins.legend = { display: true, labels: { boxWidth: 12, boxHeight: 12 } };
+    o.plugins.tooltip = { callbacks: { label: ctx => ' ' + ctx.dataset.label + ' ' + ctx.parsed.y + ' bpm' } };
     new Chart(document.getElementById('hrAtPace'), {
       type: 'line',
       data: { labels: pointsPace.map(p => p.date), datasets: [{
         label: 'HR @ pace', data: pointsPace.map(p => p.value),
         borderColor: c.hr, backgroundColor: c.hr,
         borderWidth: 2, pointRadius: 4, pointHoverRadius: 6,
-      }]},
+      }, ...trendDatasets(trendPace, c.hr)]},
       options: o,
     });
   }

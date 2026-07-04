@@ -205,6 +205,155 @@ def intensity_distribution(time_in_zone: list[dict]) -> dict | None:
 
 # ------------------------------------------------------------ progression
 
+# ------------------------------------------------------------ trend modeling
+
+def linear_regression(xs: list[float], ys: list[float]) -> tuple[float, float] | None:
+    """Least-squares (slope, intercept), or None with <3 points."""
+    n = len(xs)
+    if n < 3 or len(ys) != n:
+        return None
+    mx, my = statistics.mean(xs), statistics.mean(ys)
+    denom = sum((x - mx) ** 2 for x in xs)
+    if not denom:
+        return None
+    slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denom
+    return slope, my - slope * mx
+
+
+def rolling_mean(values: list[float], window: int = 5) -> list[float]:
+    """Trailing rolling average, same length as input."""
+    out = []
+    for i in range(len(values)):
+        chunk = values[max(0, i - window + 1):i + 1]
+        out.append(round(statistics.mean(chunk), 2))
+    return out
+
+
+def trend_series(points: list[dict], window: int = 5) -> dict:
+    """Rolling average + linear-regression fit for [{'date','value'}...],
+    plus the slope per 30 days. Dates are ISO 'YYYY-MM-DD'."""
+    from datetime import date
+    if len(points) < 3:
+        return {"rolling": None, "fit": None, "slope_per_30d": None}
+    xs = [date.fromisoformat(p["date"][:10]).toordinal() for p in points]
+    ys = [p["value"] for p in points]
+    reg = linear_regression([float(x) for x in xs], ys)
+    fit = [round(reg[0] * x + reg[1], 2) for x in xs] if reg else None
+    return {
+        "rolling": rolling_mean(ys, window),
+        "fit": fit,
+        "slope_per_30d": round(reg[0] * 30, 2) if reg else None,
+    }
+
+
+def improvement_stats(points_hr: list[dict], points_pace: list[dict],
+                      weekly: list[dict]) -> dict:
+    """Yes/No fitness verdicts from the aerobic trend slopes and volume.
+
+    - pace @ HR: improving iff pace drops (slope < -0.5 s/km per 30 days)
+    - HR @ pace: improving iff HR drops (slope < -0.3 bpm per 30 days)
+    - volume: last 4 full weeks vs the previous 4
+    """
+    hr_trend = trend_series(points_hr)
+    pace_trend = trend_series(points_pace)
+
+    def verdict(slope, threshold):
+        if slope is None:
+            return None
+        return bool(slope < threshold)
+
+    vol_change_pct = None
+    if len(weekly) >= 2:
+        kms = [w["km"] for w in weekly]
+        recent = kms[-4:]
+        previous = kms[-8:-4] or kms[:-len(recent)] or None
+        if previous:
+            prev_avg = statistics.mean(previous)
+            if prev_avg:
+                vol_change_pct = round(
+                    100 * (statistics.mean(recent) - prev_avg) / prev_avg, 1)
+
+    pace_at_hr_improving = verdict(hr_trend["slope_per_30d"], -0.5)
+    hr_at_pace_improving = verdict(pace_trend["slope_per_30d"], -0.3)
+    aerobic = [v for v in (pace_at_hr_improving, hr_at_pace_improving)
+               if v is not None]
+    return {
+        "pace_at_hr_slope_30d": hr_trend["slope_per_30d"],       # s/km / 30d
+        "pace_at_hr_improving": pace_at_hr_improving,
+        "hr_at_pace_slope_30d": pace_trend["slope_per_30d"],     # bpm / 30d
+        "hr_at_pace_improving": hr_at_pace_improving,
+        "volume_change_pct": vol_change_pct,
+        "volume_increasing": None if vol_change_pct is None else vol_change_pct > 0,
+        "improving": any(aerobic) if aerobic else None,
+    }
+
+
+# ------------------------------------------------------------ clustering
+
+CLUSTER_RUN_TOLERANCE = 0.10    # ±10% distance for easy/long runs
+CLUSTER_TIME_TOLERANCE = 0.15   # work-time equivalence (3x12' ~ 4x10')
+
+
+def session_signature(session: dict, segments: list[dict]) -> tuple:
+    """('dist', (rep distances...)) / ('time', total work s) / ('run', km).
+
+    Distance-rep sessions cluster by their rep-distance set regardless of
+    count (6x1km groups with 8x1km); time-rep sessions by total work time;
+    plain runs by total distance.
+    """
+    from . import intervals as _iv
+    reps = [s for s in segments if s["kind"] == "rep" and not s["outlier"]]
+    if not reps or (session.get("session_type") in ("easy", "long")):
+        return ("run", session.get("total_distance_m") or 0)
+    snaps = [_iv.snap_distance(r["distance_m"]) for r in reps]
+    snapped = [s for s in snaps if s]
+    if snapped and len(snapped) >= 0.8 * len(reps):
+        return ("dist", tuple(sorted(set(snapped))))
+    return ("time", sum(r["timer_s"] or 0 for r in reps))
+
+
+def cluster_sessions(entries: list[dict]) -> list[dict]:
+    """entries: [{'session': {...}, 'segments': [...]}]. Returns clusters
+    of 'similar' sessions (fuzzy volume/time equivalence)."""
+    tagged = []
+    for e in entries:
+        kind, value = session_signature(e["session"], e["segments"])
+        tagged.append({"kind": kind, "value": value, **e})
+
+    clusters: list[dict] = []
+
+    dist_groups: dict[tuple, list] = {}
+    for t in [t for t in tagged if t["kind"] == "dist"]:
+        dist_groups.setdefault(t["value"], []).append(t)
+    for reps_key, members in dist_groups.items():
+        label = " + ".join(f"{d}m" for d in reps_key) + " reps"
+        clusters.append({"kind": "dist", "label": label, "members": members})
+
+    for kind, tol, fmt in (
+        ("time", CLUSTER_TIME_TOLERANCE, lambda v: f"~{int(round(v / 60))}' work"),
+        ("run", CLUSTER_RUN_TOLERANCE, lambda v: f"~{v / 1000:.0f} km run"),
+    ):
+        pool = sorted([t for t in tagged if t["kind"] == kind],
+                      key=lambda t: t["value"])
+        current: list = []
+        for t in pool:
+            if current and t["value"] > (1 + tol) * current[0]["value"]:
+                clusters.append({"kind": kind,
+                                 "label": fmt(statistics.median(c["value"] for c in current)),
+                                 "members": current})
+                current = []
+            current.append(t)
+        if current:
+            clusters.append({"kind": kind,
+                             "label": fmt(statistics.median(c["value"] for c in current)),
+                             "members": current})
+
+    for c in clusters:
+        c["members"].sort(key=lambda m: m["session"].get("start_time_utc") or "")
+    clusters.sort(key=lambda c: -len(c["members"]))
+    return clusters
+
+
 def _pace_cv(records: list[dict]) -> float | None:
     paces = [pace_s_per_km(r.get("enhanced_speed")) for r in records]
     paces = [p for p in paces if p]
