@@ -220,6 +220,223 @@ def backfill_segment_hr(segments: list[dict], records: list[dict]) -> None:
                 seg["max_hr"] = max(hrs)
 
 
+# ------------------------------------------------------------ efficiency
+
+REGRESSION_MIN_REPS = 4
+REGRESSION_MIN_SPREAD_S_KM = 15.0
+REGRESSION_MIN_R2 = 0.6
+REI_COMPARE_PACE_TOL_S_KM = 10.0
+REI_CHANGE_NOTABLE_PCT = 1.0
+TYPICAL_PACE_COST_BPM = 5.0   # bpm per 10 s/km, threshold-range default
+
+
+def session_efficiency(rep_efforts: list[dict]) -> dict:
+    """Drift-aware REI summary for one session's work reps.
+
+    Early-session REI (first ceil(n/3) valid reps) is the primary
+    cross-session value: HR drifts upward across reps at constant pace,
+    so a full-session mean conflates drift with efficiency."""
+    valid = [e for e in rep_efforts if e.get("rei")]
+    valid.sort(key=lambda e: e.get("rep_index") or 0)
+    out = {"n_reps": len(rep_efforts), "n_hr_valid": len(valid),
+           "rei_early": None, "rei_full": None, "domain": None,
+           "median_pace_s_km": None}
+    paces = [e["pace_s_km"] for e in rep_efforts if e.get("pace_s_km")]
+    if paces:
+        out["median_pace_s_km"] = round(statistics.median(paces), 1)
+    if rep_efforts:
+        domains = [e["domain"] for e in rep_efforts]
+        out["domain"] = statistics.mode(domains)
+    out["mean_hr"] = None
+    if valid:
+        early_n = math.ceil(len(valid) / 3)
+        out["rei_early"] = round(statistics.mean(e["rei"] for e in valid[:early_n]), 5)
+        out["rei_full"] = round(statistics.mean(e["rei"] for e in valid), 5)
+        out["mean_hr"] = round(statistics.mean(e["hr_median"] for e in valid), 1)
+    return out
+
+
+def gated_regression(rep_efforts: list[dict], ref_hr: float,
+                     ref_pace_s_km: float | None) -> dict:
+    """Within-session HR<->pace regression, only when the session
+    supports it (>= 4 valid same-domain reps, pace spread >= 15 s/km,
+    R^2 >= 0.6). Otherwise: not computable — no silent garbage."""
+    valid = [e for e in rep_efforts if e.get("rei")]
+    out = {"valid": False, "reason": None, "pace_cost": None,
+           "expected_hr_at_ref_pace": None, "expected_pace_at_ref_hr": None,
+           "r2": None, "n": len(valid)}
+    if len(valid) < REGRESSION_MIN_REPS:
+        out["reason"] = f"needs ≥{REGRESSION_MIN_REPS} reps with stabilized HR (has {len(valid)})"
+        return out
+    if len({e["domain"] for e in valid}) > 1:
+        out["reason"] = "reps span multiple effort domains"
+        return out
+    paces = [e["pace_s_km"] for e in valid]
+    hrs = [e["hr_median"] for e in valid]
+    spread = max(paces) - min(paces)
+    if spread < REGRESSION_MIN_SPREAD_S_KM:
+        out["reason"] = f"single-pace session (pace spread {spread:.0f} s/km < {REGRESSION_MIN_SPREAD_S_KM:.0f})"
+        return out
+    reg = linear_regression(paces, hrs)
+    if reg is None:
+        out["reason"] = "degenerate fit"
+        return out
+    slope, intercept = reg
+    fitted = [slope * p + intercept for p in paces]
+    ss_res = sum((h - f) ** 2 for h, f in zip(hrs, fitted))
+    mean_hr = statistics.mean(hrs)
+    ss_tot = sum((h - mean_hr) ** 2 for h in hrs)
+    r2 = 1 - ss_res / ss_tot if ss_tot else 0.0
+    if r2 < REGRESSION_MIN_R2:
+        out["reason"] = f"fit too noisy (R² {r2:.2f} < {REGRESSION_MIN_R2})"
+        return out
+    out.update({
+        "valid": True,
+        "r2": round(r2, 2),
+        # slope is bpm per s/km; pace cost = ΔHR per 10 s/km faster
+        "pace_cost": round(-slope * 10, 1),
+    })
+    if slope:
+        out["expected_pace_at_ref_hr"] = round((ref_hr - intercept) / slope, 1)
+    if ref_pace_s_km is not None:
+        lo, hi = min(paces), max(paces)
+        out["ref_pace_in_range"] = lo - 5 <= ref_pace_s_km <= hi + 5
+        out["expected_hr_at_ref_pace"] = round(slope * ref_pace_s_km + intercept, 1)
+    return out
+
+
+def compare_sessions(cur: dict, prev: dict, cur_meta: dict, prev_meta: dict) -> dict:
+    """The answer to "am I improving?" between two similar sessions.
+
+    cur/prev are session_efficiency() outputs; *_meta carries date +
+    hot flag. Returns verdict + evidence-carrying insights. Refuses to
+    compare across domains or pace ranges (invalid comparison beats a
+    wrong one)."""
+    insights: list[str] = []
+    verdict, delta_pct = "not_comparable", None
+    explained = False  # a model-based branch already judged the pace gap
+
+    if not cur["n_reps"] or not prev["n_reps"]:
+        return {"verdict": verdict, "delta_pct": None,
+                "insights": ["No work reps to compare."]}
+    if cur["domain"] != prev["domain"]:
+        return {"verdict": verdict, "delta_pct": None, "insights": [
+            f"Different effort domains ({cur['domain']} vs {prev['domain']}) — "
+            "efficiency comparison is not valid across domains."]}
+
+    pace_d = None
+    if cur["median_pace_s_km"] and prev["median_pace_s_km"]:
+        pace_d = cur["median_pace_s_km"] - prev["median_pace_s_km"]  # <0 faster
+
+    if cur["rei_early"] and prev["rei_early"]:
+        if pace_d is not None and abs(pace_d) > REI_COMPARE_PACE_TOL_S_KM:
+            # Paces too far apart for raw REI (speed/HR is not linear
+            # across intensities). Judge with the expected pace cost
+            # instead: ~5 bpm per 10 s/km at these intensities.
+            hr_d = (cur["mean_hr"] or 0) - (prev["mean_hr"] or 0)
+            expected_rise = (-pace_d / 10.0) * TYPICAL_PACE_COST_BPM
+            margin = 2.0
+            explained = True
+            if pace_d < 0:  # current session faster
+                if hr_d <= expected_rise - margin:
+                    verdict = "improving"
+                    insights.append(
+                        f"Faster by {abs(pace_d):.0f} s/km with only "
+                        f"{hr_d:+.0f} bpm (expected ~{expected_rise:+.0f} bpm "
+                        f"at typical pace cost) — efficiency gain vs "
+                        f"{prev_meta.get('date')}.")
+                elif hr_d >= expected_rise + margin:
+                    verdict = "similar"
+                    insights.append(
+                        f"Faster by {abs(pace_d):.0f} s/km but {hr_d:+.0f} bpm "
+                        f"(more than the ~{expected_rise:+.0f} expected) — "
+                        "mostly higher cardiovascular effort, not fitness.")
+                else:
+                    verdict = "similar"
+                    insights.append(
+                        f"Faster by {abs(pace_d):.0f} s/km at roughly the "
+                        f"expected heart-rate cost ({hr_d:+.0f} bpm) — "
+                        "consistent effort scaling, no clear efficiency change.")
+            else:  # current session slower
+                if hr_d <= expected_rise - margin:
+                    verdict = "improving"
+                    insights.append(
+                        f"Slower by {pace_d:.0f} s/km but HR dropped "
+                        f"{hr_d:+.0f} bpm (more than expected) — "
+                        "lower cost at easier pace.")
+                else:
+                    verdict = "similar"
+                    insights.append(
+                        f"Slower session at proportionally lower effort "
+                        f"({hr_d:+.0f} bpm) — no efficiency signal.")
+        else:
+            delta_pct = round(100 * (cur["rei_early"] - prev["rei_early"])
+                              / prev["rei_early"], 1)
+            if delta_pct >= REI_CHANGE_NOTABLE_PCT:
+                verdict = "improving"
+                insights.append(
+                    f"Running efficiency improved {delta_pct:+.1f}% vs "
+                    f"{prev_meta.get('date')} (early-session REI, "
+                    f"n={cur['n_hr_valid']} vs {prev['n_hr_valid']} reps, "
+                    f"{cur['domain']} domain).")
+            elif delta_pct <= -REI_CHANGE_NOTABLE_PCT:
+                verdict = "declining"
+                insights.append(
+                    f"Running efficiency decreased {delta_pct:+.1f}% vs "
+                    f"{prev_meta.get('date')} (early-session REI, "
+                    f"n={cur['n_hr_valid']} vs {prev['n_hr_valid']} reps).")
+            else:
+                verdict = "similar"
+                insights.append(
+                    f"Efficiency within noise of {prev_meta.get('date')} "
+                    f"({delta_pct:+.1f}%).")
+
+    # Plain-language pace/HR evidence (skipped when the expected-cost
+    # model already explained the pace gap above).
+    cur_hr = _mean_valid_hr(cur)
+    prev_hr = _mean_valid_hr(prev)
+    if not explained and pace_d is not None and cur_hr and prev_hr:
+        hr_d = cur_hr - prev_hr
+        if abs(pace_d) <= 5 and hr_d <= -3:
+            insights.append(f"Same pace, {abs(hr_d):.0f} bpm lower heart rate.")
+        elif abs(pace_d) <= 5 and hr_d >= 3:
+            insights.append(f"Same pace, {hr_d:.0f} bpm higher heart rate.")
+        elif pace_d <= -5 and hr_d >= 3 and (delta_pct is None or delta_pct < REI_CHANGE_NOTABLE_PCT):
+            insights.append(
+                f"Faster by {abs(pace_d):.0f} s/km but {hr_d:.0f} bpm higher — "
+                "mostly explained by higher cardiovascular effort.")
+        elif pace_d <= -5 and hr_d <= 0:
+            insights.append(
+                f"Faster by {abs(pace_d):.0f} s/km at no extra heart-rate cost.")
+
+    if verdict == "not_comparable" and cur["n_hr_valid"] == 0:
+        insights.append(
+            "No stabilized HR available for these reps (< 90 s or flagged) — "
+            "pace-only comparison: "
+            f"{fmt_pace(prev['median_pace_s_km'])} → {fmt_pace(cur['median_pace_s_km'])}.")
+        if pace_d is not None:
+            verdict = "improving" if pace_d < -2 else ("declining" if pace_d > 2 else "similar")
+
+    if cur_meta.get("hot") or prev_meta.get("hot"):
+        insights.append("⚠ One of the sessions is heat-flagged — HR "
+                        "comparison is confounded by temperature.")
+    return {"verdict": verdict, "delta_pct": delta_pct, "insights": insights}
+
+
+def _mean_valid_hr(eff: dict) -> float | None:
+    return eff.get("mean_hr")
+
+
+def cluster_reference_pace(all_rep_efforts: list[dict], domain: str,
+                           days: int = 60) -> float | None:
+    """Data-derived reference pace: rolling 60-day median rep pace of a
+    domain (never an aspirational constant)."""
+    paces = [e["pace_s_km"] for e in all_rep_efforts
+             if e.get("domain") == domain and e.get("pace_s_km")
+             and e.get("recent", True)]
+    return round(statistics.median(paces), 1) if paces else None
+
+
 # ------------------------------------------------------------ race prediction
 
 BEST_EFFORT_DISTANCES_M = (1000, 1609, 3000, 5000, 10000)

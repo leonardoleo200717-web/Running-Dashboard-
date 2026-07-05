@@ -2,21 +2,27 @@
 {% block title %}RunLens — Race predictor{% endblock %}
 {% block content %}
 <h1>Race predictor</h1>
-<p class="muted">Three classic models — Riegel (power law), Daniels-Gilbert
-VDOT, and Cameron — anchored on your best recent effort (last
-{{ window_days }} days, from 1 Hz record data).</p>
+<p class="muted">Anchored on <strong>confirmed race performances only</strong> —
+never on rolling windows over interval sessions (they include recoveries and
+are not race-equivalent).</p>
 
-{% if anchor %}
+{% if anchor_race %}
 <div class="stat-row">
-  <div class="stat"><div class="label">Anchor effort</div>
-    <div class="value">{{ (anchor.d / 1000) | round(1) }} km in {{ anchor.t | hms }}</div></div>
-  <div class="stat"><div class="label">Anchor date</div>
-    <div class="value">{{ anchor.date }}</div></div>
+  <div class="stat"><div class="label">Tier 1 anchor</div>
+    <div class="value">{{ anchor_race.label }}</div></div>
+  <div class="stat"><div class="label">Performance</div>
+    <div class="value">{{ (anchor_race.distance_m / 1000) | round(1) }} km
+      in {{ anchor_race.time_s | hms }}</div></div>
+  <div class="stat"><div class="label">Date</div>
+    <div class="value">{{ anchor_race.date }}</div></div>
   <div class="stat"><div class="label">VDOT</div>
     <div class="value">{{ vdot }}</div></div>
+  <div class="stat"><div class="label">4-week volume</div>
+    <div class="value">{{ last4 }} km/wk</div></div>
 </div>
 
-<h2>Predictions</h2>
+<h2>Predictions <span class="muted" style="font-weight:400">(tier 1 — from the
+confirmed race)</span></h2>
 <div class="card">
   <table>
     <thead><tr><th>Distance</th><th>Riegel</th><th>VDOT (Daniels)</th>
@@ -24,7 +30,14 @@ VDOT, and Cameron — anchored on your best recent effort (last
     <tbody>
     {% for p in predictions %}
       <tr>
-        <td><strong>{{ p.label }}</strong></td>
+        <td><strong>{{ p.label }}</strong>
+          {% if p.label == 'Marathon' %}
+            {% if volume_supported %}
+              <span style="color:var(--good-text); font-size:.8rem">supported by volume ✔</span>
+            {% else %}
+              <span class="flag">volume {{ last4 }} &lt; ~{{ support_km }} km/wk</span>
+            {% endif %}
+          {% endif %}</td>
         <td>{{ p.riegel_s | hms }}</td>
         <td>{{ p.vdot_s | hms }}</td>
         <td>{{ p.cameron_s | hms }}</td>
@@ -34,21 +47,67 @@ VDOT, and Cameron — anchored on your best recent effort (last
     {% endfor %}
     </tbody>
   </table>
+  {% if marathon_band %}
+  <p class="muted">Marathon range with the low-volume correction
+  (Riegel exponent 1.06 → 1.15, Vickers–Vertosick):
+  <strong>{{ marathon_band.low | hms }} – {{ marathon_band.high | hms }}</strong>.</p>
+  {% endif %}
+  <p class="muted" style="font-size:.85rem">Anchor from {{ anchor_race.date }} —
+  the older it is, the less it reflects current fitness. Add a recent race or
+  test below to re-anchor.</p>
 </div>
-<p class="muted" style="font-size:.85rem">Marathon and half-marathon
-predictions from a {{ (anchor.d / 1000) | round(1) }} km anchor assume the
-endurance is trained: treat them as a ceiling unless weekly volume supports
-the distance. A longer anchor (10 km best) makes long predictions much more
-reliable.</p>
+{% else %}
+<p class="muted">No confirmed races yet — add one below.</p>
+{% endif %}
 
-<h2>Best efforts (last {{ window_days }} days)</h2>
+<h2>Tier 2 — Critical Speed model</h2>
 <div class="card">
+  {% if cs_status %}
+  <p class="muted">Not available yet: {{ cs_status }}. Prescribed-pace training
+  reps are excluded by design (submaximal with recoveries — they would corrupt
+  CS/D′).</p>
+  {% else %}
+  <p>Enough confirmed efforts — CS fit coming in the next release.</p>
+  {% endif %}
+</div>
+
+<h2>Confirmed races &amp; test efforts</h2>
+<div class="card">
+  {% if races %}
+  <table>
+    <thead><tr><th>Date</th><th>Label</th><th>Distance</th><th>Time</th><th>Pace</th></tr></thead>
+    <tbody>
+    {% for r in races %}
+      <tr>
+        <td>{{ r.date }}</td><td>{{ r.label }}</td>
+        <td>{{ (r.distance_m / 1000) | round(2) }} km</td>
+        <td>{{ r.time_s | hms }}</td>
+        <td>{{ (r.time_s / (r.distance_m / 1000)) | pace }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+  <form method="post" action="{{ url_for('add_race') }}" style="margin-top:.8rem">
+    <input type="text" name="date" placeholder="2026-07-15" size="10" required>
+    <input type="text" name="distance_km" placeholder="21.1" size="5" required>
+    <input type="text" name="time" placeholder="1:25:00" size="8" required>
+    <input type="text" name="label" placeholder="HM test" size="12">
+    <button class="primary" type="submit">Add race / test</button>
+    <span class="muted">A 12–15' max test unlocks the Critical Speed model.</span>
+  </form>
+</div>
+
+<h2>Best rolling efforts <span class="muted" style="font-weight:400">
+(last {{ window_days }} days — information only, never used as anchors)</span></h2>
+<div class="card">
+  {% if bests %}
   <table>
     <thead><tr><th>Distance</th><th>Time</th><th>Pace</th><th>Date</th><th></th></tr></thead>
     <tbody>
     {% for d, b in bests | dictsort %}
-      <tr {% if anchor and d == anchor.d %}style="font-weight:700"{% endif %}>
-        <td>{{ d }} m {% if anchor and d == anchor.d %}<span class="muted">← anchor</span>{% endif %}</td>
+      <tr>
+        <td>{{ d }} m</td>
         <td>{{ b.t | hms }}</td>
         <td>{{ (b.t / (d / 1000)) | pace }}</td>
         <td>{{ b.date }}</td>
@@ -57,9 +116,6 @@ reliable.</p>
     {% endfor %}
     </tbody>
   </table>
+  {% else %}<p class="muted">No qualifying efforts in the window.</p>{% endif %}
 </div>
-{% else %}
-<p class="muted">No qualifying efforts found yet — import sessions with at
-least 1 km of continuous running in the last {{ window_days }} days.</p>
-{% endif %}
 {% endblock %}

@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from flask import Flask, flash, redirect, render_template, request, url_for
 
+from . import efforts as efforts_mod
 from . import ingest, intervals, metrics, store
 
 DISPLAY_TZ = ZoneInfo("Europe/Amsterdam")  # UTC internally, local at display time
@@ -50,6 +51,12 @@ def process_activity(activity: dict) -> tuple[int, bool, dict]:
     try:
         session_id, created = store.save_session(
             con, ingest.dedup_key(activity), activity, result, kpis, candidates)
+        # Steady Effort Store: hygiene first, then extraction (PROPOSAL v2).
+        settings = store.get_settings(con)
+        cleaned = efforts_mod.clean_heart_rate(records)
+        efforts_mod.smooth_speed(cleaned)
+        eff = efforts_mod.extract_efforts(result["segments"], cleaned, pauses, settings)
+        store.save_efforts(con, session_id, eff)
         # Re-apply per-segment kind overrides after a re-parse.
         if any(k.startswith("segkind:") for k in store.get_overrides(con, session_id)):
             _recompute_session(con, session_id)
@@ -69,7 +76,8 @@ def _stored_segments_and_records(con, session_id):
     records = [{"timestamp": store.parse_ts(r["ts"]),
                 "distance": r["distance_m"],
                 "enhanced_speed": r["speed_ms"],
-                "heart_rate": r["hr"], "cadence": r["cadence"]}
+                "heart_rate": r["hr"], "cadence": r["cadence"],
+                "power": r["power"]}
                for r in store.get_records(con, session_id)]
     return segs, records
 
@@ -94,6 +102,12 @@ def _recompute_session(con, session_id):
         " WHERE id = ?",
         (structure, json.dumps(kpis, default=str), session_id))
     con.commit()
+    # Reclassified segments change the effort store too.
+    settings = store.get_settings(con)
+    cleaned = efforts_mod.clean_heart_rate(records)
+    efforts_mod.smooth_speed(cleaned)
+    eff = efforts_mod.extract_efforts(segs, cleaned, [], settings)
+    store.save_efforts(con, session_id, eff)
 
 
 # ------------------------------------------------------------ template helpers
@@ -241,6 +255,51 @@ def session_detail(session_id):
                        if m["session"]["id"] != session_id]
             break
 
+    # Physiological efficiency (PROPOSAL v2 §4).
+    con = db()
+    try:
+        settings = store.get_settings(con)
+        rep_effs = store.get_efforts(con, session_id, "rep")
+        efficiency = metrics.session_efficiency(rep_effs)
+        ref_pace = None
+        if efficiency["domain"]:
+            cutoff = store.parse_ts(session["start_time_utc"])
+            all_eff = store.all_efforts_with_dates(con)
+            recent = [e for e in all_eff
+                      if e["kind"] == "rep" and e["domain"] == efficiency["domain"]
+                      and e["session_date"] and cutoff
+                      and 0 <= (cutoff - store.parse_ts(e["session_date"])).days <= 60]
+            paces = [e["pace_s_km"] for e in recent if e["pace_s_km"]]
+            if paces:
+                import statistics as _st
+                ref_pace = round(_st.median(paces), 1)
+        regression = metrics.gated_regression(rep_effs, settings["ref_hr"], ref_pace)
+        # Verdict vs previous similar session.
+        verdict = None
+        if similar:
+            older = [s for s in similar
+                     if (s["start_time_utc"] or "") < (session["start_time_utc"] or "")]
+            if older:
+                older.sort(key=lambda s: s["start_time_utc"] or "", reverse=True)
+                prev, prev_eff = older[0], None
+                for cand in older:  # prefer the latest same-domain session
+                    ce = metrics.session_efficiency(
+                        store.get_efforts(con, cand["id"], "rep"))
+                    if ce["domain"] == efficiency["domain"]:
+                        prev, prev_eff = cand, ce
+                        break
+                if prev_eff is None:
+                    prev_eff = metrics.session_efficiency(
+                        store.get_efforts(con, prev["id"], "rep"))
+                verdict = metrics.compare_sessions(
+                    efficiency, prev_eff,
+                    {"date": (session["start_time_utc"] or "")[:10],
+                     "hot": session.get("hot")},
+                    {"date": (prev["start_time_utc"] or "")[:10],
+                     "hot": prev.get("hot")})
+    finally:
+        con.close()
+
     # 1 Hz series for the pace/HR charts, downsampled for the wire (~600 pts).
     step = max(1, len(records) // 600)
     series = []
@@ -254,7 +313,22 @@ def session_detail(session_id):
         })
     return render_template("session.html", session=session, segments=segs,
                            series=series, phases=phases, similar=similar,
-                           cluster_idx=cluster_idx, segment_kinds=_SEGMENT_KINDS)
+                           cluster_idx=cluster_idx, segment_kinds=_SEGMENT_KINDS,
+                           efficiency=efficiency, regression=regression,
+                           ref_pace=ref_pace, ref_hr=settings["ref_hr"],
+                           verdict=verdict)
+
+
+@app.route("/session/<int:session_id>/hot", methods=["POST"])
+def toggle_hot(session_id):
+    con = db()
+    try:
+        con.execute("UPDATE sessions SET hot = 1 - COALESCE(hot, 0) WHERE id = ?",
+                    (session_id,))
+        con.commit()
+    finally:
+        con.close()
+    return redirect(url_for("session_detail", session_id=session_id))
 
 
 _SEGMENT_KINDS = {"rep": "Active", "recovery": "Recovery",
@@ -319,10 +393,40 @@ def trends():
     trend_hr = metrics.trend_series(points_hr)
     trend_pace = metrics.trend_series(points_pace)
     stats = metrics.improvement_stats(points_hr, points_pace, weekly)
+
+    # Per-domain efficiency trends (PROPOSAL v2 §5): early-session REI
+    # per session per domain, never mixed across domains.
+    import math as _math
+    from collections import defaultdict
+    con = db()
+    try:
+        all_eff = store.all_efforts_with_dates(con)
+    finally:
+        con.close()
+    grouped: dict = defaultdict(list)
+    for e in all_eff:
+        if e["rei"] and e["session_date"]:
+            grouped[(e["domain"], e["session_id"], e["session_date"][:10],
+                     bool(e["session_hot"]))].append(e)
+    domain_points: dict = defaultdict(list)
+    for (dom, sid, date, hot), effs in grouped.items():
+        reps = sorted([e for e in effs if e["kind"] == "rep"],
+                      key=lambda e: e["rep_index"] or 0)
+        pool = reps[:_math.ceil(len(reps) / 3)] if reps else effs
+        value = sum(e["rei"] for e in pool) / len(pool)
+        domain_points[dom].append({"date": date, "value": round(value * 1000, 2),
+                                   "hot": hot, "session_id": sid})
+    domain_trends = {}
+    for dom in ("easy", "steady", "threshold", "hard"):
+        pts = sorted(domain_points.get(dom, []), key=lambda p: p["date"])
+        if pts:
+            domain_trends[dom] = {"points": pts,
+                                  "trend": metrics.trend_series(pts)}
+
     return render_template("trends.html", points_hr=points_hr,
                            points_pace=points_pace, weekly=weekly,
                            trend_hr=trend_hr, trend_pace=trend_pace,
-                           stats=stats,
+                           stats=stats, domain_trends=domain_trends,
                            hr_band=metrics.DEFAULT_HR_BAND,
                            pace_band=metrics.DEFAULT_PACE_BAND_S)
 
@@ -348,20 +452,68 @@ def predictor():
     finally:
         con.close()
 
-    # Anchor: the longest solid best effort (longer anchors predict long
-    # races far better than short ones).
-    anchor = None
-    for d in (10000, 5000, 3000, 1609, 1000):
-        if d in bests:
-            anchor = {"d": d, **bests[d]}
-            break
-    predictions, vdot = [], None
-    if anchor:
-        predictions = metrics.race_predictions(anchor["t"], anchor["d"])
-        vdot = round(metrics.vdot_from(anchor["t"], anchor["d"]), 1)
-    return render_template("predictor.html", bests=bests, anchor=anchor,
-                           predictions=predictions, vdot=vdot,
-                           window_days=window_days)
+    # Tier 1 (PROPOSAL v2 §6): confirmed races only — never a rolling
+    # window over interval sessions.
+    con = db()
+    try:
+        races = store.list_races(con)
+        all_sessions = store.list_sessions(con)
+    finally:
+        con.close()
+    weekly = metrics.weekly_volume(all_sessions)
+    last4 = round(sum(w["km"] for w in weekly[-4:]) / max(1, len(weekly[-4:])), 1) \
+        if weekly else 0.0
+
+    anchor_race, predictions, vdot, marathon_band = None, [], None, None
+    MARATHON_SUPPORT_KM_WK = 65  # stated assumption, adjustable
+    volume_supported = last4 >= MARATHON_SUPPORT_KM_WK
+    if races:
+        anchor_race = max(races, key=lambda r: r["date"])
+        t1, d1 = anchor_race["time_s"], anchor_race["distance_m"]
+        predictions = metrics.race_predictions(t1, d1)
+        vdot = round(metrics.vdot_from(t1, d1), 1)
+        if d1 < 42195 and not volume_supported:
+            # Volume-corrected marathon band: Riegel 1.06 (trained
+            # endurance) .. 1.15 (low-volume bound, Vickers-Vertosick
+            # finding for recreational marathoners).
+            marathon_band = {
+                "low": round(t1 * (42195 / d1) ** 1.06),
+                "high": round(t1 * (42195 / d1) ** 1.15),
+            }
+
+    # Critical Speed needs >= 3 confirmed maximal efforts spanning ~2-15'.
+    cs_efforts = [r for r in races if 120 <= r["time_s"] <= 1500]
+    cs_status = (None if len(cs_efforts) >= 3 else
+                 "needs ≥ 3 confirmed maximal efforts of 2–15' (has "
+                 f"{len(cs_efforts)}) — tag a 12–15' max test to unlock")
+
+    return render_template("predictor.html", bests=bests, races=races,
+                           anchor_race=anchor_race, predictions=predictions,
+                           vdot=vdot, window_days=window_days,
+                           last4=last4, volume_supported=volume_supported,
+                           support_km=MARATHON_SUPPORT_KM_WK,
+                           marathon_band=marathon_band, cs_status=cs_status)
+
+
+@app.route("/predictor/race", methods=["POST"])
+def add_race():
+    date = (request.form.get("date") or "").strip()
+    label = (request.form.get("label") or "").strip()
+    try:
+        distance_m = float(request.form.get("distance_km")) * 1000
+        parts = [int(p) for p in (request.form.get("time") or "").split(":")]
+        time_s = parts[0] * 3600 + parts[1] * 60 + parts[2] if len(parts) == 3 \
+            else parts[0] * 60 + parts[1]
+    except (TypeError, ValueError, IndexError):
+        flash("Race not added — need date, distance (km) and time (h:mm:ss).")
+        return redirect(url_for("predictor"))
+    con = db()
+    try:
+        store.add_race(con, date, distance_m, time_s, label or "race")
+    finally:
+        con.close()
+    flash("Race added — predictor re-anchored.")
+    return redirect(url_for("predictor"))
 
 
 @app.route("/clusters")
@@ -389,27 +541,92 @@ def cluster_detail(cluster_idx):
     # paces for run clusters. Capped at 8 sessions (the categorical
     # palette's fixed slot count) — newest 8 win.
     members = cluster["members"][-8:]
-    overlay = []
-    for m in members:
-        segs = m["segments"]
-        if cluster["kind"] in ("dist", "time"):
-            sel = [s for s in segs if s["kind"] == "rep" and not s["outlier"]]
-        else:
-            sel = [s for s in segs if (s["timer_s"] or 0) > 60][:30]
-        paces = [round(metrics.pace_s_per_km(s["avg_speed_ms"]), 1)
-                 if s["avg_speed_ms"] else None for s in sel]
-        hrs = [round(s["avg_hr"]) if s.get("avg_hr") else None for s in sel]
-        overlay.append({
-            "session_id": m["session"]["id"],
-            "date": (m["session"]["start_time_utc"] or "")[:10],
-            "structure": m["session"].get("structure"),
-            "paces": paces,
-            "hrs": hrs,
-        })
+    con = db()
+    try:
+        overlay, trend_points, sess_eff = [], [], {}
+        for m in members:
+            sid = m["session"]["id"]
+            segs = m["segments"]
+            if cluster["kind"] in ("dist", "time"):
+                sel = [s for s in segs if s["kind"] == "rep" and not s["outlier"]]
+            else:
+                sel = [s for s in segs if (s["timer_s"] or 0) > 60][:30]
+            paces = [round(metrics.pace_s_per_km(s["avg_speed_ms"]), 1)
+                     if s["avg_speed_ms"] else None for s in sel]
+            hrs = [round(s["avg_hr"]) if s.get("avg_hr") else None for s in sel]
+            cum, total = [], 0.0
+            for s in sel:
+                total += (s["timer_s"] or 0) / 60.0
+                cum.append(round(total, 1))
+            eff = metrics.session_efficiency(store.get_efforts(con, sid, "rep"))
+            sess_eff[sid] = eff
+            date = (m["session"]["start_time_utc"] or "")[:10]
+            overlay.append({
+                "session_id": sid, "date": date,
+                "structure": m["session"].get("structure"),
+                "domain": eff["domain"],
+                "paces": paces, "hrs": hrs, "cum_min": cum,
+            })
+            trend_points.append({
+                "date": date, "session_id": sid,
+                "rei": round(eff["rei_early"] * 1000, 2) if eff["rei_early"] else None,
+                "pace": eff["median_pace_s_km"],
+                "n_hr": eff["n_hr_valid"],
+                "domain": eff["domain"],
+            })
+
+        # The verdict: newest vs the most recent SAME-DOMAIN session (a
+        # hard 5x1500 must not be judged against a steady 6x1500); fall
+        # back to the immediate previous with an explanation.
+        verdict, compared = None, None
+        if len(members) >= 2:
+            cur_m = members[-1]
+            cur_dom = sess_eff[cur_m["session"]["id"]]["domain"]
+            prev_m = next((m for m in reversed(members[:-1])
+                           if sess_eff[m["session"]["id"]]["domain"] == cur_dom),
+                          members[-2])
+            verdict = metrics.compare_sessions(
+                sess_eff[cur_m["session"]["id"]],
+                sess_eff[prev_m["session"]["id"]],
+                {"date": (cur_m["session"]["start_time_utc"] or "")[:10],
+                 "hot": cur_m["session"].get("hot")},
+                {"date": (prev_m["session"]["start_time_utc"] or "")[:10],
+                 "hot": prev_m["session"].get("hot")})
+            compared = {"cur": (cur_m["session"]["start_time_utc"] or "")[:10],
+                        "prev": (prev_m["session"]["start_time_utc"] or "")[:10]}
+
+        # If the newest session has no same-domain partner, still answer
+        # the question with the most recent comparable PAIR in the group.
+        pair_verdict, pair_compared = None, None
+        if verdict and verdict["verdict"] == "not_comparable" and len(members) >= 2:
+            for i in range(len(members) - 1, 0, -1):
+                di = sess_eff[members[i]["session"]["id"]]["domain"]
+                for j in range(i - 1, -1, -1):
+                    if sess_eff[members[j]["session"]["id"]]["domain"] == di:
+                        pv = metrics.compare_sessions(
+                            sess_eff[members[i]["session"]["id"]],
+                            sess_eff[members[j]["session"]["id"]],
+                            {"date": (members[i]["session"]["start_time_utc"] or "")[:10],
+                             "hot": members[i]["session"].get("hot")},
+                            {"date": (members[j]["session"]["start_time_utc"] or "")[:10],
+                             "hot": members[j]["session"].get("hot")})
+                        if pv["verdict"] != "not_comparable":
+                            pair_verdict = pv
+                            pair_compared = {
+                                "cur": (members[i]["session"]["start_time_utc"] or "")[:10],
+                                "prev": (members[j]["session"]["start_time_utc"] or "")[:10]}
+                            break
+                if pair_verdict:
+                    break
+    finally:
+        con.close()
+
     x_max = max((len(o["paces"]) for o in overlay), default=0)
     return render_template("cluster.html", cluster=cluster,
                            cluster_idx=cluster_idx, overlay=overlay,
-                           x_max=x_max,
+                           trend_points=trend_points, verdict=verdict,
+                           compared=compared, pair_verdict=pair_verdict,
+                           pair_compared=pair_compared, x_max=x_max,
                            x_label="Rep" if cluster["kind"] in ("dist", "time") else "Segment")
 
 

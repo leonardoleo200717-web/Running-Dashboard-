@@ -63,7 +63,40 @@ CREATE TABLE IF NOT EXISTS progression_points (
     source TEXT,
     label TEXT
 );
+CREATE TABLE IF NOT EXISTS efforts (
+    id INTEGER PRIMARY KEY,
+    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,                 -- rep / steady
+    rep_index INTEGER,
+    start_time TEXT, end_time TEXT,
+    timer_s REAL, distance_m REAL,
+    speed_ms REAL, pace_s_km REAL,
+    hr_median REAL, hr_valid INTEGER DEFAULT 0, hr_suspect INTEGER DEFAULT 0,
+    domain TEXT, domain_basis TEXT,
+    rei REAL, avg_power REAL,
+    boundary_version INTEGER DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_efforts_session ON efforts(session_id);
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+CREATE TABLE IF NOT EXISTS races (
+    id INTEGER PRIMARY KEY,
+    date TEXT NOT NULL,
+    distance_m REAL NOT NULL,
+    time_s REAL NOT NULL,
+    label TEXT,
+    source TEXT DEFAULT 'user'          -- user / auto-proposed
+);
 """
+
+# Schema v2 additive columns (ALTER guarded — sqlite has no IF NOT EXISTS).
+_MIGRATIONS = (
+    "ALTER TABLE records ADD COLUMN power INTEGER",
+    "ALTER TABLE sessions ADD COLUMN temperature REAL",
+    "ALTER TABLE sessions ADD COLUMN hot INTEGER DEFAULT 0",
+)
 
 # Anchor points seeded from the previous manual artifact (spec 4.1).
 _SEED_ANCHORS = (
@@ -86,13 +119,96 @@ def parse_ts(value: str | None):
     return datetime.fromisoformat(value)
 
 
+_SEED_RACES = (
+    ("2025-05-11", 42195.0, 10440.0, "Leiden Marathon 2:54"),
+)
+
+
 def connect(path: str = DB_FILENAME) -> sqlite3.Connection:
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
     con.executescript(_SCHEMA)
+    for stmt in _MIGRATIONS:
+        try:
+            con.execute(stmt)
+        except sqlite3.OperationalError:
+            pass  # column already there
     _seed_anchors(con)
+    if not con.execute("SELECT 1 FROM races LIMIT 1").fetchone():
+        con.executemany(
+            "INSERT INTO races (date, distance_m, time_s, label) VALUES (?, ?, ?, ?)",
+            _SEED_RACES)
+    con.commit()
     return con
+
+
+# ------------------------------------------------------------ settings / races
+
+def get_settings(con: sqlite3.Connection) -> dict:
+    from .efforts import DEFAULT_SETTINGS
+    rows = con.execute("SELECT key, value FROM settings")
+    stored = {r["key"]: float(r["value"]) for r in rows}
+    return {**DEFAULT_SETTINGS, **stored}
+
+
+def set_setting(con: sqlite3.Connection, key: str, value) -> None:
+    con.execute("INSERT INTO settings (key, value) VALUES (?, ?)"
+                " ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                (key, str(value)))
+    con.commit()
+
+
+def list_races(con: sqlite3.Connection) -> list[dict]:
+    return [dict(r) for r in
+            con.execute("SELECT * FROM races ORDER BY date DESC")]
+
+
+def add_race(con: sqlite3.Connection, date: str, distance_m: float,
+             time_s: float, label: str) -> None:
+    con.execute("INSERT INTO races (date, distance_m, time_s, label) VALUES (?, ?, ?, ?)",
+                (date, distance_m, time_s, label))
+    con.commit()
+
+
+# ------------------------------------------------------------ efforts
+
+def save_efforts(con: sqlite3.Connection, session_id: int,
+                 efforts: list[dict]) -> None:
+    con.execute("DELETE FROM efforts WHERE session_id = ?", (session_id,))
+    con.executemany(
+        "INSERT INTO efforts (session_id, kind, rep_index, start_time, end_time,"
+        " timer_s, distance_m, speed_ms, pace_s_km, hr_median, hr_valid,"
+        " hr_suspect, domain, domain_basis, rei, avg_power, boundary_version)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [(session_id, e["kind"], e["rep_index"], _iso(e["start_time"]),
+          _iso(e["end_time"]), e["timer_s"], e["distance_m"], e["speed_ms"],
+          e["pace_s_km"], e["hr_median"], 1 if e["hr_valid"] else 0,
+          1 if e["hr_suspect"] else 0, e["domain"], e["domain_basis"],
+          e["rei"], e["avg_power"], e["boundary_version"])
+         for e in efforts])
+    con.commit()
+
+
+def get_efforts(con: sqlite3.Connection, session_id: int,
+                kind: str | None = None) -> list[dict]:
+    if kind:
+        rows = con.execute(
+            "SELECT * FROM efforts WHERE session_id = ? AND kind = ?"
+            " ORDER BY start_time", (session_id, kind))
+    else:
+        rows = con.execute(
+            "SELECT * FROM efforts WHERE session_id = ? ORDER BY start_time",
+            (session_id,))
+    return [dict(r) for r in rows]
+
+
+def all_efforts_with_dates(con: sqlite3.Connection) -> list[dict]:
+    rows = con.execute(
+        "SELECT e.*, s.start_time_utc AS session_date, s.hot AS session_hot"
+        " FROM efforts e JOIN sessions s ON s.id = e.session_id"
+        " ORDER BY s.start_time_utc")
+    return [dict(r) for r in rows]
 
 
 def _seed_anchors(con: sqlite3.Connection) -> None:
@@ -140,6 +256,7 @@ def save_session(con: sqlite3.Connection, dedup_key: str, activity: dict,
         "structure": result.get("structure"),
         "wkt_name": result.get("wkt_name"),
         "needs_manual_tag": 1 if result.get("needs_manual_tag") else 0,
+        "temperature": session.get("avg_temperature"),
         "kpis_json": json.dumps(kpis, default=str),
     }
 
@@ -170,12 +287,13 @@ def save_session(con: sqlite3.Connection, dedup_key: str, activity: dict,
          for i, s in enumerate(result.get("segments", []))],
     )
 
-    # Full 1 Hz storage (section 6 decision #2).
+    # Full 1 Hz storage (section 6 decision #2), power included (schema v2).
     con.executemany(
-        "INSERT INTO records (session_id, ts, distance_m, speed_ms, hr, cadence)"
-        " VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO records (session_id, ts, distance_m, speed_ms, hr, cadence, power)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
         [(session_id, _iso(r["timestamp"]), r.get("distance"),
-          r.get("enhanced_speed"), r.get("heart_rate"), r.get("cadence"))
+          r.get("enhanced_speed"), r.get("heart_rate"), r.get("cadence"),
+          r.get("power"))
          for r in activity.get("records", [])],
     )
 
@@ -272,7 +390,7 @@ def get_intervals(con: sqlite3.Connection, session_id: int) -> list[dict]:
 
 def get_records(con: sqlite3.Connection, session_id: int) -> list[dict]:
     rows = con.execute(
-        "SELECT ts, distance_m, speed_ms, hr, cadence FROM records"
+        "SELECT ts, distance_m, speed_ms, hr, cadence, power FROM records"
         " WHERE session_id = ? ORDER BY ts", (session_id,))
     return [dict(r) for r in rows]
 

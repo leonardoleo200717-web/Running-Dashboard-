@@ -26,15 +26,15 @@ import logging
 
 log = logging.getLogger(__name__)
 
-# MVP record fields (spec 2.3). Other fields exist in the files but are
-# deliberately not carried forward.
-_RECORD_FIELDS = ("timestamp", "distance", "enhanced_speed", "heart_rate", "cadence")
+# Record fields (spec 2.3 + power/temperature for the efficiency module).
+_RECORD_FIELDS = ("timestamp", "distance", "enhanced_speed", "heart_rate",
+                  "cadence", "power", "temperature")
 
 _SESSION_FIELDS = (
     "start_time", "timestamp", "sport", "sub_sport",
     "total_distance", "total_timer_time", "total_elapsed_time",
     "avg_speed", "enhanced_avg_speed", "avg_heart_rate", "max_heart_rate",
-    "total_ascent", "total_descent", "num_laps",
+    "total_ascent", "total_descent", "num_laps", "avg_temperature",
 )
 
 _LAP_FIELDS = (

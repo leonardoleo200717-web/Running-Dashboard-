@@ -81,6 +81,62 @@
 </div>
 {% endif %}
 
+{% if efficiency and efficiency.n_reps %}
+<h2>Physiological efficiency</h2>
+{% if verdict %}
+<div class="card" style="border-left: 6px solid
+  {%- if verdict.verdict == 'improving' %} var(--status-good)
+  {%- elif verdict.verdict == 'declining' %} var(--status-crit)
+  {%- elif verdict.verdict == 'similar' %} var(--status-warn)
+  {%- else %} var(--baseline){% endif %};">
+  <strong>
+    {% if verdict.verdict == 'improving' %}✔ Improving vs previous similar session
+    {% elif verdict.verdict == 'declining' %}✘ Below previous similar session
+    {% elif verdict.verdict == 'similar' %}≈ In line with previous similar session
+    {% else %}– Not comparable with previous similar session{% endif %}
+  </strong>
+  <ul style="margin:.4rem 0 0; padding-left:1.2rem">
+    {% for line in verdict.insights %}<li>{{ line }}</li>{% endfor %}
+  </ul>
+</div>
+{% endif %}
+<div class="stat-row">
+  <div class="stat"><div class="label">Early-session REI</div>
+    <div class="value">{{ (efficiency.rei_early * 1000) | round(2) if efficiency.rei_early else '–' }}</div></div>
+  <div class="stat"><div class="label">Full-session REI <span title="drift-inclusive">ⓘ</span></div>
+    <div class="value">{{ (efficiency.rei_full * 1000) | round(2) if efficiency.rei_full else '–' }}</div></div>
+  <div class="stat"><div class="label">Domain</div>
+    <div class="value">{{ efficiency.domain or '–' }}</div></div>
+  <div class="stat"><div class="label">Reps with stabilized HR</div>
+    <div class="value">{{ efficiency.n_hr_valid }}/{{ efficiency.n_reps }}</div></div>
+  <div class="stat">
+    <div class="label">Heat flag</div>
+    <div class="value">
+      <form class="inline" method="post" action="{{ url_for('toggle_hot', session_id=session.id) }}">
+        <button type="submit">{{ '🔥 hot' if session.hot else 'normal' }}</button>
+      </form>
+    </div>
+  </div>
+</div>
+<div class="card">
+  {% if regression.valid %}
+    <p><strong>HR ↔ pace regression</strong> (R² {{ regression.r2 }}, n={{ regression.n }}):
+    pace cost <strong>{{ regression.pace_cost }} bpm per 10 s/km faster</strong>
+    {% if regression.expected_pace_at_ref_hr %}
+      · predicted pace @ {{ ref_hr | int }} bpm:
+      <strong>{{ regression.expected_pace_at_ref_hr | pace }}</strong>{% endif %}
+    {% if regression.expected_hr_at_ref_pace and ref_pace %}
+      · predicted HR @ {{ ref_pace | pace }}:
+      <strong>{{ regression.expected_hr_at_ref_pace | int }} bpm</strong>
+      {% if regression.get('ref_pace_in_range') == false %}
+        <span class="flag">(outside observed range)</span>{% endif %}
+    {% endif %}</p>
+  {% else %}
+    <p class="muted">Normalized performance not computable — {{ regression.reason }}.</p>
+  {% endif %}
+</div>
+{% endif %}
+
 {% if series %}
 <h2>Pace</h2>
 <div class="card"><div class="chart-box"><canvas id="paceChart"></canvas></div></div>

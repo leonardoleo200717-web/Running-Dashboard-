@@ -2,26 +2,97 @@
 {% block title %}RunLens — Compare: {{ cluster.label }}{% endblock %}
 {% block content %}
 <h1>Compare: {{ cluster.label }}</h1>
-<p class="muted">{{ cluster.members | length }} similar sessions overlapped
-— pace per {{ x_label | lower }}, one line per session (newest 8 shown).
+<p class="muted">{{ cluster.members | length }} similar sessions.
 <a href="{{ url_for('clusters_page') }}">← all groups</a></p>
 
-<h2>Pace (min/km)</h2>
-<div class="card"><div class="chart-box tall"><canvas id="overlay"></canvas></div></div>
-<h2>Heart rate (bpm)</h2>
-<div class="card"><div class="chart-box"><canvas id="overlayHr"></canvas></div></div>
+{% if verdict %}
+<div class="card" style="border-left: 6px solid
+  {%- if verdict.verdict == 'improving' %} var(--status-good)
+  {%- elif verdict.verdict == 'declining' %} var(--status-crit)
+  {%- elif verdict.verdict == 'similar' %} var(--status-warn)
+  {%- else %} var(--baseline){% endif %};">
+  <div style="font-size:1.2rem; font-weight:700; margin-bottom:.4rem">
+    {% if verdict.verdict == 'improving' %}✔ IMPROVING
+    {% elif verdict.verdict == 'declining' %}✘ NOT IMPROVING
+    {% elif verdict.verdict == 'similar' %}≈ NO MEANINGFUL CHANGE
+    {% else %}– NOT COMPARABLE{% endif %}
+    {% if verdict.delta_pct is not none %}
+      <span class="muted" style="font-weight:400">
+        early-session efficiency {{ '%+.1f%%' | format(verdict.delta_pct) }}</span>
+    {% endif %}
+    {% if compared %}
+      <span class="muted" style="font-weight:400; font-size:.9rem">
+        — {{ compared.cur }} vs {{ compared.prev }}</span>
+    {% endif %}
+  </div>
+  <ul style="margin:0; padding-left:1.2rem">
+    {% for line in verdict.insights %}<li>{{ line }}</li>{% endfor %}
+  </ul>
+  {% if pair_verdict %}
+  <hr style="border:none; border-top:1px solid var(--grid); margin:.7rem 0">
+  <div>
+    <strong>Last comparable pair in this group</strong>
+    <span class="muted">({{ pair_compared.cur }} vs {{ pair_compared.prev }})</span>:
+    {% if pair_verdict.verdict == 'improving' %}
+      <span style="color:var(--good-text); font-weight:700">✔ IMPROVING</span>
+    {% elif pair_verdict.verdict == 'declining' %}
+      <span style="color:var(--status-crit); font-weight:700">✘ NOT IMPROVING</span>
+    {% else %}≈ no meaningful change{% endif %}
+    {% if pair_verdict.delta_pct is not none %}
+      ({{ '%+.1f%%' | format(pair_verdict.delta_pct) }})
+    {% endif %}
+    <ul style="margin:.3rem 0 0; padding-left:1.2rem">
+      {% for line in pair_verdict.insights %}<li>{{ line }}</li>{% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+
+<h2>Efficiency across these sessions
+  <span class="muted" style="font-weight:400">— early-session REI (speed/HR ×1000);
+  higher = fitter at the same effort</span></h2>
+<div class="card"><div class="chart-box"><canvas id="effTrend"></canvas></div></div>
+
+<h2>Rep-by-rep overlay</h2>
+<div class="card">
+  <div id="chips" style="display:flex; gap:.5rem; flex-wrap:wrap; align-items:center;
+       margin-bottom:.8rem">
+    <span class="muted" style="font-size:.85rem">Sessions (click to toggle,
+      double-click to solo):</span>
+    <!-- chips injected -->
+    <button type="button" id="allBtn">All</button>
+    <button type="button" id="noneBtn">None</button>
+    <span style="flex:1"></span>
+    <label class="muted" style="font-size:.85rem">
+      X-axis:
+      <select id="xMode">
+        <option value="rep">{{ x_label }} #</option>
+        <option value="time">cumulative work time (min)</option>
+      </select>
+    </label>
+  </div>
+  <h2 style="margin-top:0">Pace (min/km)</h2>
+  <div class="chart-box"><canvas id="overlay"></canvas></div>
+  <h2>Heart rate (bpm)</h2>
+  <div class="chart-box"><canvas id="overlayHr"></canvas></div>
+</div>
 
 <div class="card">
   <table>
-    <thead><tr><th></th><th>Date</th><th>Structure</th><th>Avg rep pace</th></tr></thead>
+    <thead><tr><th></th><th>Date</th><th>Structure</th><th>Domain</th>
+               <th>Avg rep pace</th><th>REI</th></tr></thead>
     <tbody>
-    {% for o in overlay %}
+    {% for o in overlay %}{% set t = trend_points[loop.index0] %}
       <tr>
         <td><span class="swatch" data-slot="{{ loop.index0 }}"></span></td>
         <td><a class="rowlink" href="{{ url_for('session_detail', session_id=o.session_id) }}">
             {{ o.date }}</a></td>
         <td>{{ o.structure or '—' }}</td>
+        <td class="muted">{{ o.domain or '–' }}</td>
         <td data-avg="{{ loop.index0 }}">–</td>
+        <td>{{ t.rei if t.rei else '–' }}
+          <span class="muted" style="font-size:.8rem">(n={{ t.n_hr }})</span></td>
       </tr>
     {% endfor %}
     </tbody>
@@ -32,14 +103,21 @@
 {% block scripts %}
 <style>
   .swatch { display:inline-block; width: 14px; height: 14px; border-radius: 4px; }
+  .chip {
+    display:inline-flex; align-items:center; gap:.35rem; cursor:pointer;
+    padding:.15rem .6rem; border-radius:999px; border:1px solid var(--border);
+    font-size:.85rem; user-select:none;
+  }
+  .chip.off { opacity:.35; }
+  .chip .dot { width:10px; height:10px; border-radius:3px; }
 </style>
 <script>
   const c = vizColors();
   const overlay = {{ overlay | tojson }};
+  const trendPoints = {{ trend_points | tojson }};
   const xMax = {{ x_max }};
-  const labels = Array.from({length: xMax}, (_, i) => i + 1);
+  const xLabelName = '{{ x_label }}';
 
-  // Color follows the session (fixed categorical slots, never cycled).
   document.querySelectorAll('.swatch').forEach(el => {
     el.style.background = c.cats[+el.dataset.slot % 8];
   });
@@ -52,37 +130,120 @@
     }
   });
 
-  const o = baseOptions(c);
-  o.scales.y.reverse = true;
-  o.scales.y.ticks = { callback: v => fmtPace(v) };
-  o.scales.x.title = { display: true, text: '{{ x_label }} #', color: c.muted };
-  o.plugins.legend = { display: true, labels: { boxWidth: 12, boxHeight: 12 } };
-  o.plugins.tooltip = { callbacks: {
-    label: ctx => ' ' + ctx.dataset.label + ' ' + fmtPace(ctx.parsed.y) } };
-  new Chart(document.getElementById('overlay'), {
-    type: 'line',
-    data: { labels, datasets: overlay.map((s, i) => ({
-      label: s.date, data: s.paces,
-      borderColor: c.cats[i % 8], backgroundColor: c.cats[i % 8],
-      borderWidth: 2, pointRadius: 4, pointHoverRadius: 6, spanGaps: true,
-    }))},
-    options: o,
-  });
+  // --- Efficiency trend: the "am I improving?" chart -------------------
+  // Points are colored by effort domain: only same-colored points are
+  // comparable (REI drops at higher intensity by construction).
+  const domainColor = { easy: c.cats[1], steady: c.cats[0],
+                        threshold: c.cats[2], hard: c.cats[5] };
+  {
+    const o = baseOptions(c);
+    o.plugins.legend = { display: true, labels: { boxWidth: 12, boxHeight: 12 } };
+    o.plugins.tooltip = { callbacks: {
+      label: ctx => {
+        const p = trendPoints[ctx.dataIndex];
+        return p.rei != null
+          ? ` ${p.domain}: REI ${p.rei} · pace ${fmtPace(p.pace)} (n=${p.n_hr})`
+          : ` pace ${fmtPace(p.pace)} (no stabilized HR)`;
+      } } };
+    const hasRei = trendPoints.some(p => p.rei != null);
+    if (!hasRei) {  // pace-only fallback (short-rep clusters)
+      o.scales.y.reverse = true;
+      o.scales.y.ticks = { callback: v => fmtPace(v) };
+    }
+    const labels = trendPoints.map(p => p.date);
+    const datasets = [{
+      label: hasRei ? 'REI (colored by domain)' : 'Median rep pace',
+      data: trendPoints.map(p => hasRei ? p.rei : p.pace),
+      borderColor: c.baseline, borderDash: [4, 4], borderWidth: 1.5,
+      pointRadius: 6, pointHoverRadius: 8, spanGaps: true,
+      pointBackgroundColor: trendPoints.map(p => domainColor[p.domain] || c.muted),
+      pointBorderColor: trendPoints.map(p => domainColor[p.domain] || c.muted),
+    }];
+    new Chart(document.getElementById('effTrend'), {
+      type: 'line', data: { labels, datasets }, options: o,
+    });
+  }
 
-  // Same sessions, same colors: HR per rep on its own axis below.
-  const oh = baseOptions(c);
-  oh.scales.x.title = { display: true, text: '{{ x_label }} #', color: c.muted };
-  oh.plugins.legend = { display: true, labels: { boxWidth: 12, boxHeight: 12 } };
-  oh.plugins.tooltip = { callbacks: {
-    label: ctx => ' ' + ctx.dataset.label + ' ' + ctx.parsed.y + ' bpm' } };
-  new Chart(document.getElementById('overlayHr'), {
-    type: 'line',
-    data: { labels, datasets: overlay.map((s, i) => ({
-      label: s.date, data: s.hrs,
+  // --- Overlays with one selection bar --------------------------------
+  let xMode = 'rep';
+  let paceChart, hrChart;
+  const hidden = new Set();
+
+  function datasetsFor(metric) {
+    return overlay.map((s, i) => ({
+      label: s.date,
+      data: xMode === 'rep'
+        ? s[metric]
+        : s[metric].map((v, k) => ({ x: s.cum_min[k], y: v })),
       borderColor: c.cats[i % 8], backgroundColor: c.cats[i % 8],
       borderWidth: 2, pointRadius: 4, pointHoverRadius: 6, spanGaps: true,
-    }))},
-    options: oh,
+      hidden: hidden.has(i),
+    }));
+  }
+  function xScale() {
+    return xMode === 'rep'
+      ? { grid: { display: false }, border: { color: c.baseline },
+          title: { display: true, text: xLabelName + ' #', color: c.muted } }
+      : { type: 'linear', grid: { display: false }, border: { color: c.baseline },
+          title: { display: true, text: 'work time (min)', color: c.muted } };
+  }
+  function build() {
+    if (paceChart) paceChart.destroy();
+    if (hrChart) hrChart.destroy();
+    const labels = Array.from({length: xMax}, (_, i) => i + 1);
+    const op = baseOptions(c);
+    op.plugins.legend = { display: false };
+    op.scales.x = xScale();
+    op.scales.y.reverse = true;
+    op.scales.y.ticks = { callback: v => fmtPace(v) };
+    op.plugins.tooltip = { callbacks: {
+      label: ctx => ' ' + ctx.dataset.label + ' ' + fmtPace(ctx.parsed.y) } };
+    paceChart = new Chart(document.getElementById('overlay'), {
+      type: 'line', data: { labels, datasets: datasetsFor('paces') }, options: op });
+    const oh = baseOptions(c);
+    oh.plugins.legend = { display: false };
+    oh.scales.x = xScale();
+    oh.plugins.tooltip = { callbacks: {
+      label: ctx => ' ' + ctx.dataset.label + ' ' + ctx.parsed.y + ' bpm' } };
+    hrChart = new Chart(document.getElementById('overlayHr'), {
+      type: 'line', data: { labels, datasets: datasetsFor('hrs') }, options: oh });
+  }
+
+  // Selection chips drive BOTH charts.
+  const chipBox = document.getElementById('chips');
+  const allBtn = document.getElementById('allBtn');
+  overlay.forEach((s, i) => {
+    const chip = document.createElement('span');
+    chip.className = 'chip';
+    chip.innerHTML = `<span class="dot" style="background:${c.cats[i % 8]}"></span>${s.date}`;
+    chip.addEventListener('click', () => {
+      hidden.has(i) ? hidden.delete(i) : hidden.add(i);
+      chip.classList.toggle('off', hidden.has(i));
+      sync();
+    });
+    chip.addEventListener('dblclick', () => {   // solo
+      hidden.clear();
+      overlay.forEach((_, j) => { if (j !== i) hidden.add(j); });
+      refreshChips(); sync();
+    });
+    chipBox.insertBefore(chip, allBtn);
   });
+  function refreshChips() {
+    document.querySelectorAll('.chip').forEach((el, i) =>
+      el.classList.toggle('off', hidden.has(i)));
+  }
+  function sync() {
+    [paceChart, hrChart].forEach(ch => {
+      ch.data.datasets.forEach((d, i) => { d.hidden = hidden.has(i); });
+      ch.update();
+    });
+  }
+  allBtn.addEventListener('click', () => { hidden.clear(); refreshChips(); sync(); });
+  document.getElementById('noneBtn').addEventListener('click', () => {
+    overlay.forEach((_, i) => hidden.add(i)); refreshChips(); sync(); });
+  document.getElementById('xMode').addEventListener('change', e => {
+    xMode = e.target.value; build(); });
+
+  build();
 </script>
 {% endblock %}
