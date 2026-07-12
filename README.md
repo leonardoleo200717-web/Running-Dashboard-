@@ -2,9 +2,46 @@
 
 Local-first running dashboard for Garmin FIT files (Forerunner 265).
 One user, local files, no auth, no cloud. Built to the spec in
-[CLAUDE.md](CLAUDE.md).
+[CLAUDE.md](CLAUDE.md); the durable regeneration spec is
+[Running.MD](Running.MD).
 
-## Quick start
+Two equivalent implementations share the same validated engine logic:
+
+| | Python (`runlens/`) | PWA (`docs/`) |
+|---|---|---|
+| Runs on | your computer (Flask + SQLite) | **any phone or computer, in the browser** |
+| Install | `pip install`, run server | open the page once, "Add to Home Screen" |
+| Data | `runlens.db` file | IndexedDB, on-device, never leaves it |
+| FIT parsing | fitdecode | own parser, byte-validated against fitdecode |
+| Engine tests | 52 pytest | 13 node tests + 13/13 real-file ledger |
+
+## PWA (Android / iPhone / desktop — no server)
+
+The `docs/` folder is a static Progressive Web App: FIT parsing, the
+full interval engine, the efficiency module, clustering, predictor and
+charts all run **in the browser**. Nothing executes server-side; your
+files and data stay on the device (IndexedDB), and it works fully
+offline after the first visit.
+
+**Host it free on GitHub Pages** (repo → Settings → Pages → "Deploy from
+a branch" → branch `claude/dashboard-md-file-ea34nj`, folder `/docs`).
+Note GitHub Pages requires the repository to be public (or a paid plan
+for private repos). Then open the URL on your phone, tap the browser
+menu → **Add to Home Screen** — it installs like an app. On the phone,
+Garmin Connect → activity → export/share the FIT straight into it, or
+pick files from Downloads.
+
+To develop locally: `python3 -m http.server -d docs 8000` and open
+http://localhost:8000 (ES modules need http, not file://).
+
+Validation tooling (Node ≥ 20, no npm install needed):
+```bash
+node --test docs/tests/engine.test.mjs        # engine unit tests
+node tools/validate_ledger.mjs <dir-of-fits>  # 13-session ground truth
+node tools/validate_parser.mjs <dir> <truth>  # parser vs fitdecode dump
+```
+
+## Python version — quick start
 
 ```bash
 pip install -r requirements.txt

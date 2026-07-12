@@ -1,0 +1,16 @@
+{
+  "name": "RunLens",
+  "short_name": "RunLens",
+  "description": "Local-first running dashboard for Garmin FIT files",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0d0d0d",
+  "theme_color": "#2a78d6",
+  "icons": [
+    { "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml",
+      "purpose": "any" },
+    { "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml",
+      "purpose": "maskable" }
+  ]
+}

@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#2a78d6">
+<title>RunLens</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/icon.svg">
+<script src="vendor/chart.umd.js"></script>
+<style>
+  :root {
+    --page: #f9f9f7; --surface: #fcfcfb;
+    --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+    --grid: #e1e0d9; --baseline: #c3c2b7;
+    --border: rgba(11,11,11,0.10);
+    --series-pace: #2a78d6; --series-hr: #e34948; --series-vol: #2a78d6;
+    --cat-1: #2a78d6; --cat-2: #1baf7a; --cat-3: #eda100; --cat-4: #008300;
+    --cat-5: #4a3aa7; --cat-6: #e34948; --cat-7: #e87ba4; --cat-8: #eb6834;
+    --status-good: #0ca30c; --status-warn: #fab219; --status-crit: #d03b3b;
+    --good-text: #006300;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page: #0d0d0d; --surface: #1a1a19;
+      --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+      --grid: #2c2c2a; --baseline: #383835;
+      --border: rgba(255,255,255,0.10);
+      --series-pace: #3987e5; --series-hr: #e66767; --series-vol: #3987e5;
+      --cat-1: #3987e5; --cat-2: #199e70; --cat-3: #c98500; --cat-4: #008300;
+      --cat-5: #9085e9; --cat-6: #e66767; --cat-7: #d55181; --cat-8: #d95926;
+      --good-text: #0ca30c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--page); color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 15px; line-height: 1.45; }
+  nav { display: flex; gap: 1rem; align-items: baseline; overflow-x: auto;
+    padding: .8rem 1rem; border-bottom: 1px solid var(--border);
+    background: var(--surface); position: sticky; top: 0; z-index: 5;
+    -webkit-overflow-scrolling: touch; }
+  nav .brand { font-weight: 700; font-size: 1.05rem; margin-right: .3rem; }
+  nav a { color: var(--ink-2); text-decoration: none; white-space: nowrap; }
+  nav a:hover, nav a.active { color: var(--ink); }
+  main { max-width: 1000px; margin: 0 auto; padding: 1rem; }
+  h1 { font-size: 1.35rem; margin: .4rem 0 1rem; }
+  h2 { font-size: 1.02rem; margin: 1.6rem 0 .6rem; color: var(--ink-2); }
+  .card { background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: .9rem 1rem; margin-bottom: 1.1rem;
+    overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: .38rem .55rem; }
+  th { color: var(--muted); font-weight: 600; font-size: .78rem;
+    text-transform: uppercase; letter-spacing: .03em;
+    border-bottom: 1px solid var(--baseline); }
+  td { border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+  tr:last-child td { border-bottom: none; }
+  a.rowlink { color: var(--ink); text-decoration: none; font-weight: 600; }
+  a.rowlink:hover { text-decoration: underline; }
+  .badge { display: inline-block; padding: .05rem .5rem; border-radius: 999px;
+    font-size: .75rem; font-weight: 600; border: 1px solid var(--border);
+    color: var(--ink-2); }
+  .badge.confidence-high { border-color: var(--status-good); }
+  .badge.confidence-medium { border-color: var(--status-warn); }
+  .badge.confidence-low { border-color: var(--status-crit); }
+  .flag { color: var(--status-crit); font-weight: 600; font-size: .8rem; }
+  .muted { color: var(--muted); }
+  .stat-row { display: flex; gap: .8rem; flex-wrap: wrap; margin-bottom: 1.1rem; }
+  .stat { background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: .6rem 1rem; min-width: 7.5rem; flex: 1 1 auto; }
+  .stat .label { color: var(--muted); font-size: .72rem;
+    text-transform: uppercase; letter-spacing: .03em; }
+  .stat .value { font-size: 1.25rem; font-weight: 700; }
+  .chart-box { position: relative; height: 260px; min-width: 320px; }
+  .chart-box.tall { height: 320px; }
+  button, input[type=submit] { font: inherit; padding: .35rem .9rem;
+    border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--ink); cursor: pointer; }
+  button.primary { background: var(--series-pace); color: #fff; border: none; }
+  input[type=text], input[type=number], input:not([type]), select {
+    font: inherit; padding: .3rem .5rem; border-radius: 8px;
+    border: 1px solid var(--baseline); background: var(--surface);
+    color: var(--ink); max-width: 12rem; }
+  input[type=file] { max-width: 14rem; }
+  .swatch { display: inline-block; width: 14px; height: 14px; border-radius: 4px; }
+  .chip { display: inline-flex; align-items: center; gap: .35rem; cursor: pointer;
+    padding: .15rem .6rem; border-radius: 999px; border: 1px solid var(--border);
+    font-size: .85rem; user-select: none; }
+  .chip.off { opacity: .35; }
+  .chip .dot { width: 10px; height: 10px; border-radius: 3px; }
+  body.dragging::after { content: "Drop FIT files to import"; position: fixed;
+    inset: 0; display: flex; align-items: center; justify-content: center;
+    font-size: 1.5rem; font-weight: 700;
+    background: color-mix(in srgb, var(--series-pace) 12%, var(--page));
+    border: 3px dashed var(--series-pace); z-index: 10; pointer-events: none; }
+</style>
+</head>
+<body>
+<nav>
+  <span class="brand">RunLens</span>
+  <a href="#/">Sessions</a>
+  <a href="#/trends">Trends</a>
+  <a href="#/progression">Progression</a>
+  <a href="#/clusters">Similar</a>
+  <a href="#/predictor">Predictor</a>
+  <a href="#/settings">Settings</a>
+</nav>
+<main id="app"><p class="muted">Loading…</p></main>
+<script type="module">
+  import { start } from './js/ui.js';
+  start();
+</script>
+</body>
+</html>
